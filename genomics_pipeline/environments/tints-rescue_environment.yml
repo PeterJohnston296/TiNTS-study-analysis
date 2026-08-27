@@ -1,0 +1,35 @@
+name: tints-rescue
+channels:
+  - conda-forge
+dependencies:
+  - _openmp_mutex=4.5
+  - biopython=1.88
+  - bzip2=1.0.8
+  - ca-certificates=2026.7.22
+  - icu=78.3
+  - libblas=3.11.0
+  - libcblas=3.11.0
+  - libcxx=22.1.8
+  - libexpat=2.8.1
+  - libffi=3.7.0
+  - libgcc=16.1.0
+  - libgfortran=16.1.0
+  - libgfortran5=16.1.0
+  - liblapack=3.11.0
+  - liblzma=5.8.3
+  - libopenblas=0.3.34
+  - libsqlite=3.53.4
+  - libzlib=1.3.2
+  - llvm-openmp=22.1.8
+  - ncurses=6.6
+  - numpy=2.4.6
+  - openssl=3.6.3
+  - packaging=26.3
+  - pip=26.2.1
+  - python=3.11.16
+  - python_abi=3.11
+  - readline=8.3
+  - setuptools=84.0.0
+  - tk=8.6.13
+  - tzdata=2026c
+  - wheel=0.48.0

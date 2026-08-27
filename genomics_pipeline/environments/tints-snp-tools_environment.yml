@@ -1,0 +1,9 @@
+name: tints-snp-tools
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - libzlib=1.3.2=h8088a28_3
+  - llvm-openmp=22.1.8=hc7d1edf_0
+  - snp-dists=1.2.0=h95b30e6_0
+  - snp-sites=2.5.1=hba9b596_7
