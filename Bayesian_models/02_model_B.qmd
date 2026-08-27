@@ -1,0 +1,1959 @@
+---
+title: "Bayesian Model B: household-coupled hidden Markov model"
+format:
+  html:
+    toc: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: source
+---
+
+# Overview
+
+Model B extends the susceptible–infected hidden Markov framework to jointly model members of the same household. Daily acquisition probability depends on the number of other latently infected household members at the preceding time step, baseline household environmental contamination, a baseline individual mobility proxy (days leaving the house in the preceding week), and a household-level random effect.
+
+The household likelihood is marginalised over joint latent states using a forward algorithm implemented in Stan, with `reduce_sum` used for within-chain parallelisation. The single household with 14 participants is excluded because the joint state space grows as $2^M$ with household size.
+
+The full fit is computationally intensive and may require multi-day runtime depending on hardware. The workflow documents data construction, model specification, priors, sampler settings, posterior summaries, and derived quantities used for the manuscript.
+
+## Mathematical notation
+
+### Latent state definition
+
+Each individual $i$ in household $h$ at time $t$ occupies a latent state:
+
+$$
+Z_{i,h,t} \in \{S,I\},
+$$
+
+Where $S$ denotes susceptible and $I$ denotes infected
+
+### Initial state distribution
+
+At the start of follow-up, latent infection states are assumed to be independent across household members:$$
+P(Z_{i,h,1} = I) = \pi, \quad logit(\pi) = \alpha_\pi.
+$$
+
+$\alpha_\pi$ captures the baseline probability of infection at study entry.
+
+### State transition model (daily Markov process)
+
+Recovery ( $I$ to $S$)
+
+$$
+P(Z_{i,h,t} = S | Z_{i,h,t-1} = I) = p_{IS}, \quad logit(p_{IS}) = \alpha_{IS}
+$$
+
+Acquistion ( $S$ to $I$ ) model B
+
+Define:
+
+-   $I_{h,t-1}$ : number of infected household members at time $t-1$
+
+-   $X_h$ : household environmental contamination indicator
+
+-   $D_i \in \{0,...,7\}$ : days leaving the house in the last week (measured at baseline)
+
+-   $D_i^{\*} = \frac{D_i - \bar{D}}{7}$ : centred and scaled community exposure
+
+    -   $D_i$ : the original value for person $i$ (0:7)
+
+    -   $D_{i}^{\*}$ : the centred and scaled version of $D_i$
+
+    -   $\bar{D}$ : the mean of $D$ across individuals
+
+-   $u_h \sim \mathcal{N}(0, \sigma_u)$ : household level random effect.
+
+Then:
+
+$$
+P(Z_{i,h,t} = I | Z_{i,h,t-1} = S) = p_{SI,i,h,t},
+$$
+
+with:
+
+$$
+logit(p_{SI,i,h,t}) = \alpha_{SI} + \beta_{hh} I{h,t-1} + \beta_{env}X_h + \beta_{comm}D_i^{\*} + u_h.
+$$
+
+Interpretation: acquisition risk is decomposed into within-household transmission pressure, shared environmental exposure, baseline community exposure propensity, and residual household heterogeneity.
+
+### Observation model: PCR detection and Ct values
+
+Let $Y_{i,h,t}$ denote the PCR observation for individual $i$ at time $t$
+
+Detection component
+
+conditional on latent state:
+
+$$
+\Pr(\text{Ct observed} \mid Z_{i,h,t} = I) = \phi_I,\qquad\Pr(\text{Ct observed} \mid Z_{i,h,t} = S) = \phi_S,
+$$
+
+with
+
+$$
+\text{logit}(\phi_I) = \alpha_{\phi I},\qquad\text{logit}(\phi_S) = \alpha_{\phi S}.
+$$
+
+Interpretation: infected and uninfected states have different probabilities of yielding an amplifiable Ct value
+
+Ct emission:
+
+$$
+C_{i,h,t} \mid Z_{i,h,t} = I \sim \mathcal{N}(\mu_I, \sigma_I^2),\qquad C_{i,h,t} \mid Z_{i,h,t} = S \sim \mathcal{N}(\mu_S, \sigma_S^2),
+$$
+
+with
+
+$\mu_I < \mu_S$
+
+interpretation: Ct values are treated as continuous measurements whose distributions differ by latent infection state.
+
+### Full likelihood (household level)
+
+For household $h$, the likelihood marginalised over all latent state sequences is
+
+$$
+L_h=\sum_{\mathbf{Z}_h}\Pr(\mathbf{Z}_{h,1})\prod_{t=2}^{T} \Pr(\mathbf{Z}_{h,t} \mid \mathbf{Z}_{h,t-1})\prod_{t=1}^{T} \Pr(\mathbf{Y}_{h,t} \mid \mathbf{Z}_{h,t}) .
+$$
+
+Where
+
+-   $L_h$ is the likelihood contribution from household $h$
+
+-   $\mathbf{Z}_{h,t}$ is the joint latent state vector of all individuals in household $h$ at time $t$
+
+-   $\mathbf{Y}_{h,t}$ is the vector of observed data (Ct / PCR outcomes) for all indiividuals in household $h$ at time $t$
+
+-   $\sum_{\mathbf{Z}_h}$ means sum over all posible latent state sequences for household $h$
+
+Interpretation: the model integrates over all possible household-level transmission histories using the forward algorithm
+
+### Community-exposure extension
+
+Model B includes introducing a baseline individual level proxy for community exposure into the S to I transition model, whilst retaining the same household level structure and continuous Ct emission model.
+
+### Reminders
+
+Due to concerns about the explosion in state space, we are still going to exclude the household with 14 participants from the model.
+
+## 1. Libraries
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(here)
+library(cmdstanr)
+library(posterior)
+library(patchwork)
+library(loo)
+```
+
+## 2. Load prepared household-model input
+
+```{r}
+setup_file <- here("rds", "model_B_prepared_input.rds")
+if (!file.exists(setup_file)) {
+  stop(
+    "Missing rds/model_B_prepared_input.rds. ",
+    "This prepared household-model input object is provided with the controlled-access analytic data package."
+  )
+}
+obj <- readRDS(setup_file)
+
+pcr_hmm        <- obj$pcr_hmm
+id_pid         <- obj$id_pid
+id_hh          <- obj$id_hh
+idx_tbl        <- obj$idx_tbl
+stan_data_base <- obj$stan_data_base
+stan_data_base_extended    <- obj$stan_data_base_extended
+
+rm(obj)
+```
+
+## 3. Read baseline mobility covariate
+
+```{r}
+CRF_B <- read_csv(here("data_raw", "CRF_B_MCA.csv"))
+#
+CRF_B <-  CRF_B %>% 
+  select(hhid, data_date, pid, dys_leav_day)
+```
+
+## 4. Join
+
+Here we attach the days leaving the house variable to every transition point
+
+```{r}
+mobility_lookup <- CRF_B %>%
+  select(pid, dys_leav_day) %>%
+  distinct()
+
+stopifnot(nrow(mobility_lookup) == n_distinct(mobility_lookup$pid))
+
+pcr_hmm <- pcr_hmm %>%
+  left_join(mobility_lookup, by = "pid")
+
+```
+
+## 5. Centre and scale
+
+-   `D_star = 0` → typical mobility
+
+-   `D_star = +1` → maximal mobility
+
+-   `D_star = −1` → minimal mobility
+
+```{r}
+
+# Person-level mean across individuals (NOT weighted by number of rows per pid)
+D_bar <- mobility_lookup %>%
+  summarise(D_bar = mean(dys_leav_day, na.rm = TRUE)) %>%
+  pull(D_bar)
+
+
+
+# Centred and scaled by 7
+pcr_hmm <- pcr_hmm %>%
+  mutate(
+    D_star = (dys_leav_day - D_bar) / 7
+  )
+
+# Check: D_star is constant within pid
+
+check_const <- pcr_hmm %>%
+  group_by(pid) %>%
+  summarise(n_unique = n_distinct(D_star), .groups = "drop") %>%
+  summarise(max_unique = max(n_unique)) %>%
+  pull(max_unique)
+
+stopifnot(check_const == 1)
+
+
+```
+
+## 6. Build Model B arrays and Stan data
+
+This chunk drops the single largest household (M = 14), re-indexes households and members, and constructs the `has_obs`, `has_ct`, and `Ct` arrays plus the precomputed joint-state table used by the household HMM with `reduce_sum`. It then **reuses the already-computed `D_star` in `pcr_hmm`**, maps it onto a household-member matrix `D_star[h, m]`, and packages everything into `stan_data_B`.
+
+```{r}
+# ---- Chunk: Build Model B arrays and Stan data (reuse precomputed D_star) ----
+
+stopifnot(exists("pcr_hmm"), exists("id_hh"), exists("id_pid"))
+stopifnot("D_star" %in% names(pcr_hmm))  # we already created this earlier
+
+# 0) Identify the one household with M=14 (distinct members)
+hh_sizes <- pcr_hmm %>%
+  distinct(hhid_id, pid_id) %>%
+  count(hhid_id, name = "M")
+
+hhid_drop <- hh_sizes %>% filter(M == 14) %>% pull(hhid_id)
+stopifnot(length(hhid_drop) == 1)
+message("Dropping household hhid_id = ", hhid_drop, " (M=14)")
+
+# 1) Clean long df and drop duplicated env cols (if present), then drop the M=14 household
+df <- pcr_hmm %>%
+  filter(hhid_id != hhid_drop) %>%
+  select(-matches("^environmental_baseline_positive\\.[xy]$")) %>%
+  mutate(
+    pid_id  = as.integer(pid_id),
+    hhid_id = as.integer(hhid_id),
+    has_obs = as.integer(has_obs),
+    has_ct  = as.integer(has_ct),
+    Ct      = as.numeric(Ct),
+    D_star  = as.numeric(D_star),
+    collection_date = as.Date(collection_date)
+  ) %>%
+  arrange(hhid_id, pid_id, collection_date)
+
+stopifnot(!any(is.na(df$D_star)))  # you said no missing; D_star is baseline-replicated
+
+# 2) Reindex households to dense 1..H_B for arrays / Stan
+hh_map <- df %>%
+  distinct(hhid_id, hhid) %>%
+  arrange(hhid_id) %>%
+  mutate(h = row_number()) %>%
+  select(hhid_id, hhid, h)
+
+H_B <- nrow(hh_map)
+
+df <- df %>%
+  left_join(hh_map %>% select(hhid_id, h), by = "hhid_id") %>%
+  arrange(h, pid_id, collection_date)
+
+stopifnot(!any(is.na(df$h)))
+
+# 3) X_h vector aligned to h=1..H_B
+X_h_B <- id_hh %>%
+  filter(hhid_id != hhid_drop) %>%
+  left_join(hh_map, by = "hhid_id") %>%
+  arrange(h) %>%
+  pull(environmental_baseline_positive) %>%
+  as.integer()
+
+stopifnot(length(X_h_B) == H_B)
+
+# 4) Roster: member_id within each household (h), stable by pid_id
+roster_B <- df %>%
+  distinct(h, pid_id, pid) %>%
+  arrange(h, pid_id) %>%
+  group_by(h) %>%
+  mutate(member_id = row_number()) %>%
+  ungroup()
+
+M_h_B <- roster_B %>%
+  count(h, name = "M_h") %>%
+  arrange(h) %>%
+  pull(M_h)
+
+M_max_B <- max(M_h_B)
+message("After exclusion: H_B=", H_B, ", M_max_B=", M_max_B, " (max states = 2^M_max_B)")
+
+# 4b) D_star matrix [H_B, M_max_B] aligned to (h, member_id)
+D_star_mat <- matrix(0.0, nrow = H_B, ncol = M_max_B)
+
+# Pull each member's baseline D_star once (it is constant within pid)
+roster_mob <- roster_B %>%
+  left_join(df %>% distinct(pid, D_star), by = "pid") %>%
+  arrange(h, member_id)
+
+stopifnot(!any(is.na(roster_mob$D_star)))
+
+for (r in seq_len(nrow(roster_mob))) {
+  hh <- roster_mob$h[r]
+  mm <- roster_mob$member_id[r]
+  D_star_mat[hh, mm] <- roster_mob$D_star[r]
+}
+
+# 5) Day index within household (t = 1..T_K), aligned to household start date
+hh_day0_B <- df %>%
+  group_by(h) %>%
+  summarise(day0 = min(collection_date), .groups = "drop")
+
+df <- df %>%
+  left_join(hh_day0_B, by = "h") %>%
+  mutate(day = as.integer(collection_date - day0) + 1L) %>%
+  select(-day0)
+
+T_K <- max(df$day)
+
+# 6) Attach member_id
+df <- df %>%
+  left_join(roster_B %>% select(h, pid_id, member_id), by = c("h", "pid_id"))
+
+stopifnot(!any(is.na(df$member_id)))
+stopifnot(all(df$member_id >= 1 & df$member_id <= M_max_B))
+
+# 7) Allocate arrays required by Stan code
+has_obs_arr <- array(0L, dim = c(H_B, M_max_B, T_K))
+has_ct_arr  <- array(0L, dim = c(H_B, M_max_B, T_K))
+Ct_arr      <- array(0.0, dim = c(H_B, M_max_B, T_K))
+
+# 7a) Ensure Ct has no NAs (store 0 when has_ct==0; Stan gates on has_ct)
+df <- df %>%
+  mutate(
+    Ct = if_else(has_ct == 1L, as.numeric(Ct), 0.0)
+  )
+
+stopifnot(!any(is.na(df$Ct)))
+
+idx <- cbind(df$h, df$member_id, df$day)
+has_obs_arr[idx] <- df$has_obs
+has_ct_arr[idx]  <- df$has_ct
+Ct_arr[idx]      <- df$Ct
+
+# 8) Precompute joint state table for maximum household size
+S_h_B  <- as.integer(2L ^ M_h_B)
+S_maxB <- as.integer(max(S_h_B))
+
+z_state_mat <- matrix(0L, nrow = S_maxB, ncol = M_max_B)
+for (s in 0:(S_maxB - 1L)) {
+  z_state_mat[s + 1L, ] <- as.integer(intToBits(s))[1:M_max_B]  # LSB = member 1
+}
+
+z_state_arr <- array(as.integer(z_state_mat), dim = c(S_maxB, M_max_B))
+
+# 9) Build Stan data list for Model B (reduce_sum + z_state + D_star[h,m])
+stan_data_B <- list(
+  H = H_B,
+  M_max = M_max_B,
+  T = T_K,
+
+  S_max = S_maxB,
+  S_h   = S_h_B,
+  z_state = z_state_arr,
+
+  M_h = as.integer(M_h_B),
+  X_h = as.integer(X_h_B),
+
+  has_obs = has_obs_arr,
+  has_ct  = has_ct_arr,
+  Ct      = Ct_arr,
+
+  D_star  = D_star_mat,   # NEW for Model B
+
+  grainsize = 2L  # tune 2–6
+)
+
+str(stan_data_B)
+
+# 10) Save setup
+dir.create(here("outputs", "rds"), recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(
+  list(
+    df_long_K    = df,
+    roster_B     = roster_B,
+    hh_map       = hh_map,
+    hh_day0_B    = hh_day0_B,
+    stan_data_B  = stan_data_B,
+    H_B          = H_B,
+    M_max_B      = M_max_B,
+    T_K          = T_K,
+    S_maxB       = S_maxB,
+    hhid_drop    = hhid_drop
+  ),
+  here("outputs", "rds", "model_B_setup.rds")
+)
+
+message("Saved Model B setup: ", here("outputs", "rds", "model_B_setup.rds"))
+
+
+```
+
+## 7. Alignment check
+
+```{r}
+# ---- Alignment check: D_star_mat[h, m] matches df$D_star ----
+
+check_D_star <- df %>%
+  distinct(h, member_id, pid, D_star) %>%
+  mutate(
+    D_star_mat = mapply(
+      function(hh, mm) D_star_mat[hh, mm],
+      h, member_id
+    )
+  )
+
+stopifnot(
+  all(abs(check_D_star$D_star - check_D_star$D_star_mat) < 1e-12)
+)
+
+message("Alignment check passed: D_star_mat[h, m] matches df$D_star for all members.")
+
+```
+
+## 8. Write and save model B
+
+```{r}
+# ---- Chunk: Write + save Model B Stan code (FORWARD-FIXED + SLICE-AWARE reduce_sum indexing) ----
+
+library(here)
+
+stan_file_B <- here(
+  "bayesian_models", "stan", "model_B_household_chmm.stan"
+)
+stopifnot(file.exists(stan_file_B))
+
+```
+
+## 9. Compile and fit model B
+
+```{r}
+# ---- Chunk: Compile + fit Model B (threaded sampling configuration) ----
+
+library(cmdstanr)
+library(here)
+
+stopifnot(exists("stan_data_B"))
+
+stan_file_B <- here("bayesian_models", "stan", "model_B_household_chmm.stan")
+stopifnot(file.exists(stan_file_B))
+
+# Threading configuration
+threads <- 2              # safe, efficient
+Sys.setenv(STAN_NUM_THREADS = threads)
+
+stan_data_B$grainsize <- 1L   
+
+mod_B <- cmdstan_model(
+  stan_file_B,
+  cpp_options = list(stan_threads = TRUE),
+  force_recompile = TRUE
+)
+
+init_fun_B <- function() {
+  list(
+    alpha_SI  = qlogis(0.04),
+    beta_env  = 0,
+    beta_hh   = 0,
+    beta_comm = 0,
+
+    alpha_IS  = qlogis(0.30),
+    alpha_pi  = qlogis(0.063),
+
+    sigma_u   = 0.3,
+    z_u       = rep(0, stan_data_B$H),
+
+    alpha_phi_I = qlogis(0.85),
+    alpha_phi_S = qlogis(0.03),
+
+    mu_raw = c(0, 1),
+
+    sigma_I = 4,
+    sigma_S = 3
+  )
+}
+
+fit_B <- mod_B$sample(
+  data = stan_data_B,
+  seed = 123,
+
+  chains = 4,
+  parallel_chains = 4,     
+  threads_per_chain = threads,
+
+  iter_warmup = 2000,
+  iter_sampling = 2000,
+
+  init = init_fun_B,
+  adapt_delta = 0.97,
+  max_treedepth = 12,
+
+  refresh = 50,
+  save_warmup = TRUE
+)
+
+fit_B
+
+
+
+```
+
+## 10. Extract parameters /traceplots and save
+
+```{r}
+# ---- Chunk: Extract summaries, LOO/WAIC, and SAVE EVERYTHING (Model B) ----
+
+stopifnot(exists("fit_B"))
+
+# -------------------------------------------------------------------------
+# 1) Parameter summaries (key epidemiological parameters)
+# -------------------------------------------------------------------------
+
+summary_B <- fit_B$draws(
+  variables = c("beta_env","beta_hh","beta_comm","sigma_u",
+                "alpha_SI","alpha_IS","alpha_pi")
+) %>%
+  posterior::as_draws_df() %>%
+  select(-.chain, -.draw, -.iteration) %>%
+  pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+  group_by(parameter) %>%
+  summarise(
+    mean    = mean(value),
+    median  = median(value),
+    sd      = sd(value),
+    q2.5    = quantile(value, 0.025),
+    q97.5   = quantile(value, 0.975),
+    p_gt_0  = mean(value > 0),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    OR_median = if_else(parameter %in% c("beta_env","beta_hh","beta_comm"),
+                        exp(median), NA_real_),
+    OR_95_lo  = if_else(parameter %in% c("beta_env","beta_hh","beta_comm"),
+                        exp(q2.5), NA_real_),
+    OR_95_hi  = if_else(parameter %in% c("beta_env","beta_hh","beta_comm"),
+                        exp(q97.5), NA_real_)
+  ) %>%
+  arrange(parameter)
+
+print(summary_B)
+
+# -------------------------------------------------------------------------
+# 2) Household-level LOO / WAIC
+#    (log_lik_household assumed length H per draw)
+# -------------------------------------------------------------------------
+
+loglik_K <- fit_B$draws("log_lik_household") %>%
+  posterior::as_draws_matrix()
+
+loo_K  <- loo::loo(loglik_K)
+waic_K <- loo::waic(loglik_K)
+
+print(loo_K)
+print(waic_K)
+
+# -------------------------------------------------------------------------
+# 3) SAVE EVERYTHING I MAY EVER NEED
+# -------------------------------------------------------------------------
+
+dir.create(here("outputs", "rds"), recursive = TRUE, showWarnings = FALSE)
+
+# Core reported outputs
+saveRDS(summary_B,
+        here("outputs", "rds", "summary_B_reducesum_comm.rds"))
+saveRDS(loo_K,
+        here("outputs", "rds", "loo_K_household.rds"))
+saveRDS(waic_K,
+        here("outputs", "rds", "waic_K_household.rds"))
+
+# Log-likelihood matrix (for future LOO comparisons)
+saveRDS(loglik_K,
+        here("outputs", "rds", "loglik_K_household_matrix.rds"))
+
+# Full posterior draws (for plots, new summaries, PPCs)
+draws_K <- fit_B$draws() %>% posterior::as_draws_df()
+saveRDS(draws_K,
+        here("outputs", "rds", "draws_K_df.rds"))
+
+# CmdStan fit object (best insurance against re-running)
+fit_B$save_object(
+  here("outputs", "rds", "fit_B_cmdstan.rds")
+)
+
+# Metadata (sampler info, chains, timing)
+saveRDS(fit_B$metadata(),
+        here("outputs", "rds", "fit_B_metadata.rds"))
+
+message("Model B fully archived. No re-run required.")
+
+
+# treaceplot
+fit_B$draws(c("beta_hh", "beta_comm", "sigma_u")) |>
+  posterior::as_draws_df() |>
+  bayesplot::mcmc_trace()
+
+```
+
+\
+
+## 11. Interpretation.
+
+In Model B, we extended a household-level hidden Markov framework to jointly model daily Salmonella acquisition and clearance while explicitly decomposing infection risk into community exposure, household transmission, environmental contamination, and unmeasured household heterogeneity. Incorporating baseline mobility as a proxy for community exposure, we found that the absolute daily probability of acquisition was low at baseline (approximately **2% per day** in the absence of infected household members, environmental contamination, and with average mobility), but increased substantially with social context. Higher community mobility was independently associated with increased risk (odds ratio **1.56**, 95% credible interval **1.03–2.40**), corresponding to an absolute daily risk of approximately **3%** among highly mobile individuals. Within-household transmission exerted the strongest effect, with each additional infected household member more than doubling acquisition risk (odds ratio **2.39**, 95% credible interval **1.72–3.21**), translating to daily risks rising from **\~2%** with no infected household members to **\~5%** with one infected member, **\~11%** with two, and exceeding **20% per day** with three infected members. Baseline household environmental contamination showed weaker but suggestive effects (odds ratio **1.17**, 95% credible interval **0.80–1.70**), while substantial residual between-household variation remained (σ_u ≈ **0.40**). Together, these results indicate that community exposure primarily seeds infection into households, whereas transmission is strongly amplified within households once infection is present, with important implications for interventions—including vaccination—that reduce susceptibility or interrupt short household transmission chains.
+
+## 12. Further save chunk
+
+```{r}
+library(digest)
+library(here)
+
+# Paths
+stan_src  <- here("models", "stan", "model_B_daily_prevstate_reducesum_comm.stan")
+out_dir   <- here("outputs", "model_B_archive")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Copy the exact Stan program used
+file.copy(stan_src, file.path(out_dir, basename(stan_src)), overwrite = TRUE)
+
+# Save a fingerprint of the Stan data
+setup <- readRDS(here("outputs", "rds", "model_B_setup.rds"))
+stan_data_B <- setup$stan_data_B
+
+saveRDS(stan_data_B, file.path(out_dir, "stan_data_B.rds"))
+writeLines(digest(stan_data_B, algo = "sha256"), file.path(out_dir, "stan_data_B_sha256.txt"))
+
+# Save session + cmdstan versions
+writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo.txt"))
+writeLines(cmdstanr::cmdstan_version(), file.path(out_dir, "cmdstan_version.txt"))
+
+```
+
+```{r}
+# ---- Model B: thesis-facing summaries, diagnostics, LOO/WAIC, traceplots ----
+
+library(tidyverse)
+library(posterior)
+library(ggplot2)
+library(here)
+library(loo)
+
+# -------------------------------------------------------------------------
+# Directories
+# -------------------------------------------------------------------------
+rds_dir <- here("outputs", "rds")
+fig_dir <- here("outputs", "figures")
+dir.create(rds_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------------------------------------------------------
+# 0) Load saved CmdStanR fit and setup
+# -------------------------------------------------------------------------
+fit_B <- readRDS(file.path(rds_dir, "fit_B_cmdstan.rds"))
+message("Loaded fit_B_cmdstan.rds")
+
+setup_K <- readRDS(file.path(rds_dir, "model_B_setup.rds"))
+stan_data_B <- setup_K$stan_data_B
+df_long_K   <- setup_K$df_long_K
+
+message("Loaded model_B_setup.rds")
+
+# -------------------------------------------------------------------------
+# 1) Try CmdStan diagnostics
+# -------------------------------------------------------------------------
+csv_files <- tryCatch(
+  fit_B$output_files(include_failed = TRUE),
+  error = function(e) character()
+)
+
+if (length(csv_files) > 0 && all(file.exists(csv_files))) {
+  message("CmdStan CSVs found → running cmdstan_diagnose()")
+  print(fit_B$cmdstan_diagnose())
+} else {
+  message(
+    "CmdStan CSV files not found or not available.\n",
+    "Using draw-based diagnostics instead."
+  )
+}
+
+# Try sampler diagnostics if available
+sampler_diag_K <- tryCatch(
+  fit_B$sampler_diagnostics(),
+  error = function(e) NULL
+)
+
+if (!is.null(sampler_diag_K)) {
+  divergences_K <- sum(sampler_diag_K[, , "divergent__"], na.rm = TRUE)
+  treedepth_hits_K <- sum(sampler_diag_K[, , "treedepth__"] >= 12, na.rm = TRUE)
+} else {
+  divergences_K <- NA_integer_
+  treedepth_hits_K <- NA_integer_
+}
+
+# -------------------------------------------------------------------------
+# 2) Extract posterior draws
+# -------------------------------------------------------------------------
+key_pars <- c(
+  "alpha_SI", "alpha_IS", "alpha_pi",
+  "beta_env", "beta_hh", "beta_comm", "sigma_u",
+  "alpha_phi_I", "alpha_phi_S",
+  "mu_I", "mu_S", "sigma_I", "sigma_S"
+)
+
+draws_df_K <- tryCatch(
+  fit_B$draws(variables = key_pars) |> posterior::as_draws_df(),
+  error = function(e) NULL
+)
+
+if (is.null(draws_df_K)) {
+  message("Falling back to saved draws_K_df.rds")
+  draws_df_K <- readRDS(file.path(rds_dir, "draws_K_df.rds")) |>
+    posterior::as_draws_df()
+}
+
+draws_tbl_K <- draws_df_K |> as_tibble()
+
+missing_key_pars <- setdiff(key_pars, names(draws_tbl_K))
+if (length(missing_key_pars) > 0) {
+  warning("Missing key parameters from draws: ", paste(missing_key_pars, collapse = ", "))
+}
+
+# -------------------------------------------------------------------------
+# 3) Draw-based convergence diagnostics
+# -------------------------------------------------------------------------
+diag_K <- posterior::summarise_draws(
+  draws_df_K,
+  mean,
+  median,
+  sd,
+  mad,
+  q2.5 = ~quantile(.x, probs = 0.025),
+  q5   = ~quantile(.x, probs = 0.05),
+  q95  = ~quantile(.x, probs = 0.95),
+  q97.5 = ~quantile(.x, probs = 0.975),
+  rhat,
+  ess_bulk,
+  ess_tail
+)
+
+print(diag_K)
+
+diagnostic_overview_K <- diag_K %>%
+  dplyr::filter(variable %in% key_pars) %>%
+  dplyr::summarise(
+    max_rhat = max(rhat, na.rm = TRUE),
+    min_ess_bulk = min(ess_bulk, na.rm = TRUE),
+    min_ess_tail = min(ess_tail, na.rm = TRUE),
+    divergences = divergences_K,
+    treedepth_hits = treedepth_hits_K
+  )
+
+print(diagnostic_overview_K)
+
+saveRDS(diag_K, file.path(rds_dir, "diagnostics_K_draw_based.rds"))
+saveRDS(diagnostic_overview_K, file.path(rds_dir, "diagnostic_overview_K.rds"))
+
+write_csv(diag_K, file.path(rds_dir, "diagnostics_K_draw_based.csv"))
+write_csv(diagnostic_overview_K, file.path(rds_dir, "diagnostic_overview_K.csv"))
+
+# -------------------------------------------------------------------------
+# 4) Core posterior parameter summary
+# -------------------------------------------------------------------------
+parameter_summary_B <- draws_tbl_K %>%
+  dplyr::select(any_of(key_pars)) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::everything(),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>%
+  dplyr::group_by(parameter) %>%
+  dplyr::summarise(
+    mean = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    q025 = quantile(value, 0.025, na.rm = TRUE),
+    q05  = quantile(value, 0.05, na.rm = TRUE),
+    q95  = quantile(value, 0.95, na.rm = TRUE),
+    q975 = quantile(value, 0.975, na.rm = TRUE),
+    p_gt_0 = mean(value > 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(parameter)
+
+print(parameter_summary_B)
+
+saveRDS(parameter_summary_B, file.path(rds_dir, "parameter_summary_B_thesis.rds"))
+write_csv(parameter_summary_B, file.path(rds_dir, "parameter_summary_B_thesis.csv"))
+
+# -------------------------------------------------------------------------
+# 5) Mobility scaling summary
+# -------------------------------------------------------------------------
+if ("dys_leav_day" %in% names(df_long_K)) {
+  mobility_person_K <- df_long_K %>%
+    dplyr::distinct(pid, hhid, dys_leav_day, D_star)
+
+  D_bar_K <- mean(mobility_person_K$dys_leav_day, na.rm = TRUE)
+
+  mobility_summary_B <- mobility_person_K %>%
+    dplyr::summarise(
+      n_people = dplyr::n(),
+      mean_days_leaving_house = mean(dys_leav_day, na.rm = TRUE),
+      median_days_leaving_house = median(dys_leav_day, na.rm = TRUE),
+      min_days_leaving_house = min(dys_leav_day, na.rm = TRUE),
+      max_days_leaving_house = max(dys_leav_day, na.rm = TRUE),
+      mean_D_star = mean(D_star, na.rm = TRUE),
+      median_D_star = median(D_star, na.rm = TRUE),
+      min_D_star = min(D_star, na.rm = TRUE),
+      max_D_star = max(D_star, na.rm = TRUE)
+    )
+} else {
+  warning("df_long_K does not contain dys_leav_day. Summarising D_star only.")
+
+  mobility_person_K <- purrr::map_dfr(seq_len(stan_data_B$H), function(h) {
+    tibble::tibble(
+      h = h,
+      member_id = seq_len(stan_data_B$M_h[h]),
+      D_star = stan_data_B$D_star[h, seq_len(stan_data_B$M_h[h])]
+    )
+  })
+
+  D_bar_K <- NA_real_
+
+  mobility_summary_B <- mobility_person_K %>%
+    dplyr::summarise(
+      n_people = dplyr::n(),
+      mean_D_star = mean(D_star, na.rm = TRUE),
+      median_D_star = median(D_star, na.rm = TRUE),
+      min_D_star = min(D_star, na.rm = TRUE),
+      max_D_star = max(D_star, na.rm = TRUE)
+    )
+}
+
+Dstar_never_K <- if (!is.na(D_bar_K)) (0 - D_bar_K) / 7 else NA_real_
+Dstar_everyday_K <- if (!is.na(D_bar_K)) (7 - D_bar_K) / 7 else NA_real_
+
+mobility_contrast_K <- tibble::tibble(
+  D_bar = D_bar_K,
+  D_star_never_leaves_house = Dstar_never_K,
+  D_star_leaves_house_every_day = Dstar_everyday_K,
+  D_star_difference_every_day_vs_never = Dstar_everyday_K - Dstar_never_K,
+  interpretation_beta_comm = "exp(beta_comm) = OR for leaving house every day vs never; exp(beta_comm / 7) = OR per additional day"
+)
+
+print(mobility_summary_B)
+print(mobility_contrast_K)
+
+saveRDS(mobility_summary_B, file.path(rds_dir, "mobility_summary_B.rds"))
+saveRDS(mobility_contrast_K, file.path(rds_dir, "mobility_contrast_K.rds"))
+
+write_csv(mobility_summary_B, file.path(rds_dir, "mobility_summary_B.csv"))
+write_csv(mobility_contrast_K, file.path(rds_dir, "mobility_contrast_K.csv"))
+
+# -------------------------------------------------------------------------
+# 6) Household data summary
+# -------------------------------------------------------------------------
+household_tbl_K <- tibble::tibble(
+  h = seq_len(stan_data_B$H),
+  household_size = stan_data_B$M_h,
+  env_positive = stan_data_B$X_h
+)
+
+household_model_data_summary_B <- household_tbl_K %>%
+  dplyr::summarise(
+    n_households = dplyr::n(),
+    min_household_size = min(household_size),
+    median_household_size = median(household_size),
+    max_household_size = max(household_size),
+    n_env_positive = sum(env_positive == 1),
+    n_env_negative = sum(env_positive == 0),
+    prop_env_positive = mean(env_positive == 1)
+  )
+
+household_size_table_K <- household_tbl_K %>%
+  dplyr::count(household_size, name = "n_households")
+
+print(household_model_data_summary_B)
+print(household_size_table_K)
+
+saveRDS(household_model_data_summary_B, file.path(rds_dir, "household_model_data_summary_B.rds"))
+saveRDS(household_size_table_K, file.path(rds_dir, "household_size_table_K.rds"))
+
+write_csv(household_model_data_summary_B, file.path(rds_dir, "household_model_data_summary_B.csv"))
+write_csv(household_size_table_K, file.path(rds_dir, "household_size_table_K.csv"))
+
+# -------------------------------------------------------------------------
+# 7) Derived epidemiological quantities for thesis interpretation
+# -------------------------------------------------------------------------
+required_for_derived <- c(
+  "alpha_SI", "alpha_IS", "alpha_pi",
+  "alpha_phi_I", "alpha_phi_S",
+  "beta_env", "beta_hh", "beta_comm", "sigma_u",
+  "mu_I", "mu_S", "sigma_I", "sigma_S"
+)
+
+stopifnot(all(required_for_derived %in% names(draws_tbl_K)))
+
+derived_draws_K <- draws_tbl_K %>%
+  dplyr::transmute(
+    # Odds ratios
+    OR_household_per_infected_member = exp(beta_hh),
+    OR_environment_positive_vs_negative = exp(beta_env),
+    OR_community_every_day_vs_never = exp(beta_comm),
+    OR_community_per_additional_day = exp(beta_comm / 7),
+    OR_household_frailty_1SD = exp(sigma_u),
+
+    # Community odds ratios relative to average mobility
+    OR_community_every_day_vs_average = exp(beta_comm * Dstar_everyday_K),
+    OR_community_never_vs_average = exp(beta_comm * Dstar_never_K),
+
+    # Baseline transition probabilities
+    p_acquisition_average_mobility_envneg_no_hh_infected = plogis(alpha_SI),
+    p_clearance = plogis(alpha_IS),
+    duration_mean_days = 1 / plogis(alpha_IS),
+    p_baseline_infected = plogis(alpha_pi),
+
+    # Acquisition probabilities under illustrative scenarios
+    p_acquisition_env_positive_avg_mobility_no_hh_infected =
+      plogis(alpha_SI + beta_env),
+
+    p_acquisition_never_leaves_envneg_no_hh_infected =
+      plogis(alpha_SI + beta_comm * Dstar_never_K),
+
+    p_acquisition_everyday_envneg_no_hh_infected =
+      plogis(alpha_SI + beta_comm * Dstar_everyday_K),
+
+    p_acquisition_avg_mobility_one_hh_infected =
+      plogis(alpha_SI + beta_hh),
+
+    p_acquisition_avg_mobility_two_hh_infected =
+      plogis(alpha_SI + 2 * beta_hh),
+
+    p_acquisition_avg_mobility_three_hh_infected =
+      plogis(alpha_SI + 3 * beta_hh),
+
+    # Emission model
+    phi_I = plogis(alpha_phi_I),
+    phi_S = plogis(alpha_phi_S),
+    specificity_like = 1 - plogis(alpha_phi_S),
+    mu_I = mu_I,
+    mu_S = mu_S,
+    sigma_I = sigma_I,
+    sigma_S = sigma_S
+  )
+
+derived_summary_B <- derived_draws_K %>%
+  tidyr::pivot_longer(
+    cols = dplyr::everything(),
+    names_to = "quantity",
+    values_to = "value"
+  ) %>%
+  dplyr::group_by(quantity) %>%
+  dplyr::summarise(
+    mean = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    q025 = quantile(value, 0.025, na.rm = TRUE),
+    q05  = quantile(value, 0.05, na.rm = TRUE),
+    q95  = quantile(value, 0.95, na.rm = TRUE),
+    q975 = quantile(value, 0.975, na.rm = TRUE),
+    p_gt_1 = mean(value > 1, na.rm = TRUE),
+    p_gt_0 = mean(value > 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(quantity)
+
+print(derived_summary_B)
+
+saveRDS(derived_summary_B, file.path(rds_dir, "derived_summary_B_thesis.rds"))
+write_csv(derived_summary_B, file.path(rds_dir, "derived_summary_B_thesis.csv"))
+
+# A compact table of the main odds ratios for the chapter
+main_OR_table_K <- derived_summary_B %>%
+  dplyr::filter(
+    quantity %in% c(
+      "OR_household_per_infected_member",
+      "OR_community_every_day_vs_never",
+      "OR_community_per_additional_day",
+      "OR_environment_positive_vs_negative",
+      "OR_household_frailty_1SD"
+    )
+  ) %>%
+  dplyr::select(quantity, median, q025, q975)
+
+print(main_OR_table_K)
+
+saveRDS(main_OR_table_K, file.path(rds_dir, "main_OR_table_K_thesis.rds"))
+write_csv(main_OR_table_K, file.path(rds_dir, "main_OR_table_K_thesis.csv"))
+
+# Compact absolute-risk scenario table
+absolute_risk_table_K <- derived_summary_B %>%
+  dplyr::filter(
+    quantity %in% c(
+      "p_acquisition_average_mobility_envneg_no_hh_infected",
+      "p_acquisition_env_positive_avg_mobility_no_hh_infected",
+      "p_acquisition_never_leaves_envneg_no_hh_infected",
+      "p_acquisition_everyday_envneg_no_hh_infected",
+      "p_acquisition_avg_mobility_one_hh_infected",
+      "p_acquisition_avg_mobility_two_hh_infected",
+      "p_acquisition_avg_mobility_three_hh_infected",
+      "p_clearance",
+      "duration_mean_days",
+      "p_baseline_infected"
+    )
+  ) %>%
+  dplyr::select(quantity, median, q025, q975)
+
+print(absolute_risk_table_K)
+
+saveRDS(absolute_risk_table_K, file.path(rds_dir, "absolute_risk_table_K_thesis.rds"))
+write_csv(absolute_risk_table_K, file.path(rds_dir, "absolute_risk_table_K_thesis.csv"))
+
+# -------------------------------------------------------------------------
+# 8) LOO / WAIC and Pareto-k diagnostics
+# -------------------------------------------------------------------------
+loglik_K <- tryCatch(
+  fit_B$draws("log_lik_household") |> posterior::as_draws_matrix(),
+  error = function(e) NULL
+)
+
+if (is.null(loglik_K) && file.exists(file.path(rds_dir, "loglik_K_household_matrix.rds"))) {
+  message("Falling back to saved loglik_K_household_matrix.rds")
+  loglik_K <- readRDS(file.path(rds_dir, "loglik_K_household_matrix.rds"))
+}
+
+if (!is.null(loglik_K)) {
+  loo_K  <- loo::loo(loglik_K)
+  waic_K <- loo::waic(loglik_K)
+
+  print(loo_K)
+  print(waic_K)
+
+  pareto_K <- tibble::tibble(
+    household_index = seq_along(loo::pareto_k_values(loo_K)),
+    pareto_k = loo::pareto_k_values(loo_K)
+  ) %>%
+    dplyr::mutate(
+      k_group = dplyr::case_when(
+        pareto_k <= 0.5 ~ "<=0.5",
+        pareto_k <= 0.7 ~ "0.5-0.7",
+        pareto_k <= 1.0 ~ "0.7-1.0",
+        TRUE ~ ">1.0"
+      )
+    )
+
+  pareto_summary_B <- pareto_K %>%
+    dplyr::count(k_group, name = "n_households") %>%
+    dplyr::arrange(k_group)
+
+  pareto_top_K <- pareto_K %>%
+    dplyr::arrange(desc(pareto_k)) %>%
+    dplyr::slice_head(n = 10)
+
+  print(pareto_summary_B)
+  print(pareto_top_K)
+
+  saveRDS(loo_K, file.path(rds_dir, "loo_K_household.rds"))
+  saveRDS(waic_K, file.path(rds_dir, "waic_K_household.rds"))
+  saveRDS(loglik_K, file.path(rds_dir, "loglik_K_household_matrix.rds"))
+  saveRDS(pareto_K, file.path(rds_dir, "pareto_K_household.rds"))
+  saveRDS(pareto_summary_B, file.path(rds_dir, "pareto_summary_B_household.rds"))
+  saveRDS(pareto_top_K, file.path(rds_dir, "pareto_top_K_household.rds"))
+
+  write_csv(pareto_K, file.path(rds_dir, "pareto_K_household.csv"))
+  write_csv(pareto_summary_B, file.path(rds_dir, "pareto_summary_B_household.csv"))
+  write_csv(pareto_top_K, file.path(rds_dir, "pareto_top_K_household.csv"))
+} else {
+  message("log_lik_household not available → skipping LOO/WAIC")
+}
+
+# Optional: compare Model J vs Model B if Model J household log-likelihood exists
+if (file.exists(file.path(rds_dir, "loglik_J_household_matrix.rds")) && !is.null(loglik_K)) {
+  loglik_J <- readRDS(file.path(rds_dir, "loglik_J_household_matrix.rds"))
+
+  if (ncol(loglik_J) == ncol(loglik_K)) {
+    loo_J <- loo::loo(loglik_J)
+    loo_compare_JK <- loo::loo_compare(loo_J, loo_K)
+
+    print(loo_compare_JK)
+
+    saveRDS(loo_compare_JK, file.path(rds_dir, "loo_compare_J_vs_K.rds"))
+    write_csv(
+      as.data.frame(loo_compare_JK) %>% tibble::rownames_to_column("model"),
+      file.path(rds_dir, "loo_compare_J_vs_K.csv")
+    )
+  } else {
+    message("Model J and Model B log-likelihood matrices have different numbers of columns; skipping comparison.")
+  }
+}
+
+# -------------------------------------------------------------------------
+# 9) Traceplots
+# -------------------------------------------------------------------------
+draws_long <- draws_tbl_K %>%
+  dplyr::select(.chain, .iteration, .draw, any_of(key_pars)) %>%
+  tidyr::pivot_longer(
+    cols = any_of(key_pars),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>%
+  dplyr::mutate(
+    parameter = factor(parameter, levels = key_pars),
+    chain = factor(.chain)
+  )
+
+p_trace <- ggplot(draws_long, aes(x = .iteration, y = value, colour = chain)) +
+  geom_line(alpha = 0.6, linewidth = 0.3) +
+  facet_wrap(~parameter, scales = "free_y") +
+  labs(
+    x = "Iteration",
+    y = "Value",
+    colour = "Chain",
+    title = "Traceplots for key Model B parameters"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+p_trace
+
+ggsave(
+  filename = file.path(fig_dir, "trace_ModelK_key_parameters.png"),
+  plot = p_trace,
+  dpi = 300,
+  width = 12,
+  height = 7,
+  bg = "white"
+)
+
+# -------------------------------------------------------------------------
+# 10) Thesis-facing forest plot
+# -------------------------------------------------------------------------
+effects_sum_K <- derived_draws_K %>%
+  dplyr::transmute(
+    `Household amplification\n(per additional infected household member yesterday)` =
+      OR_household_per_infected_member,
+    `Community exposure\n(leaving house every day vs never)` =
+      OR_community_every_day_vs_never,
+    `Community exposure\n(per additional day leaving the house)` =
+      OR_community_per_additional_day,
+    `Household environment\n(environmental contamination positive vs negative)` =
+      OR_environment_positive_vs_negative
+  ) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::everything(),
+    names_to = "Effect",
+    values_to = "OR"
+  ) %>%
+  dplyr::group_by(Effect) %>%
+  dplyr::summarise(
+    OR_med = median(OR, na.rm = TRUE),
+    lo = quantile(OR, 0.025, na.rm = TRUE),
+    hi = quantile(OR, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    label = sprintf("%.2f [%.2f to %.2f]", OR_med, lo, hi),
+    Effect = factor(
+      Effect,
+      levels = c(
+        "Household amplification\n(per additional infected household member yesterday)",
+        "Community exposure\n(leaving house every day vs never)",
+        "Community exposure\n(per additional day leaving the house)",
+        "Household environment\n(environmental contamination positive vs negative)"
+      )
+    )
+  )
+
+x_min <- min(effects_sum_K$lo, na.rm = TRUE) * 0.85
+x_max <- max(effects_sum_K$hi, na.rm = TRUE) * 1.20
+
+p_forest_K <- ggplot(effects_sum_K, aes(y = Effect, x = OR_med)) +
+  geom_vline(xintercept = 1, linetype = "22", linewidth = 0.6, colour = "grey40") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.22, linewidth = 1.0) +
+  geom_point(size = 3.3) +
+  geom_text(
+    aes(x = pmin(hi * 1.08, x_max), label = label),
+    hjust = 0,
+    size = 3.5
+  ) +
+  scale_x_log10(
+    breaks = c(0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4),
+    labels = c("0.5", "0.75", "1", "1.25", "1.5", "2", "3", "4"),
+    limits = c(x_min, x_max)
+  ) +
+  labs(
+    x = "Odds ratio (log scale)",
+    y = NULL,
+    title = "Drivers of next-day acquisition in the coupled household model",
+    subtitle = "Posterior median odds ratios with 95% credible intervals"
+  ) +
+  theme_classic(base_size = 13)
+
+p_forest_K
+
+ggsave(
+  filename = file.path(fig_dir, "forest_ModelK_effects_thesis.png"),
+  plot = p_forest_K,
+  dpi = 400,
+  width = 12,
+  height = 5.5,
+  bg = "white"
+)
+
+# -------------------------------------------------------------------------
+# 11) Final message
+# -------------------------------------------------------------------------
+message("Model B thesis summaries complete.")
+message("Key files saved in: ", rds_dir)
+message("Key figures saved in: ", fig_dir)
+
+### now ouput all summaries:
+purrr::iwalk(setNames(purrr::map(c("parameter_summary_B_thesis.csv","derived_summary_B_thesis.csv","main_OR_table_K_thesis.csv","absolute_risk_table_K_thesis.csv","mobility_summary_B.csv","mobility_contrast_K.csv","household_model_data_summary_B.csv","household_size_table_K.csv","pareto_summary_B_household.csv","diagnostic_overview_K.csv"), ~ readr::read_csv(here::here("outputs","rds", .x), show_col_types = FALSE)), c("parameter_summary_B","derived_summary_B","main_OR_table_K","absolute_risk_table_K","mobility_summary_B","mobility_contrast_K","household_model_data_summary_B","household_size_table_K","pareto_summary_B","diagnostic_overview_K")), ~ {cat("\n\n==================== ", .y, " ====================\n", sep = ""); print(.x, n = Inf, width = Inf)}) 
+```
+
+```{r}
+# ---- Publication-ready forest plot: intuitive labels + clean styling (no refit) ----
+# Outputs: outputs/figures/forest_modelK_effects_pubready.png
+
+library(tidyverse)
+library(posterior)
+library(ggplot2)
+library(scales)
+library(here)
+
+# Paths
+rds_path <- here("outputs", "rds", "draws_K_df.rds")
+fig_dir  <- here("outputs", "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+stopifnot(file.exists(rds_path))
+
+# Load draws (NO rerun)
+draws <- readRDS(rds_path) |>
+  posterior::as_draws_df() |>
+  as_tibble()
+
+# Intuitive effect scales:
+# - beta_hh: OR per additional infected household member yesterday
+# - beta_env: OR for environmentally positive vs negative household
+# - beta_comm: D_star = (days_out - mean)/7, so:
+#     OR per +1 day out/week = exp(beta_comm/7)
+#     OR for "7 days out vs 0 days out" = exp(beta_comm)
+effects_sum <- draws |>
+  transmute(
+    `Household amplification\n(per additional infected household member yesterday)` = exp(beta_hh),
+    `Community exposure\n(per additional day leaving the house in last week)`      = exp(beta_comm / 7),
+    `Community exposure\n(leaving house every day vs never)`                       = exp(beta_comm),
+    `Household environment\n(environmental contamination positive vs negative)`    = exp(beta_env)
+  ) |>
+  pivot_longer(everything(), names_to = "Effect", values_to = "OR") |>
+  group_by(Effect) |>
+  summarise(
+    OR_med = median(OR),
+    lo     = quantile(OR, 0.025),
+    hi     = quantile(OR, 0.975),
+    .groups = "drop"
+  ) |>
+  mutate(
+    # Human-readable inline label for the plot
+    label = sprintf("%.2f  [%.2f to %.2f]", OR_med, lo, hi),
+    # Order effects so the eye lands on the story: household >> community >> environment
+    Effect = factor(
+      Effect,
+      levels = c(
+        "Household amplification\n(per additional infected household member yesterday)",
+        "Community exposure\n(leaving house every day vs never)",
+        "Community exposure\n(per additional day leaving the house in last week)",
+        "Household environment\n(environmental contamination positive vs negative)"
+      )
+    )
+  ) |>
+  arrange(Effect)
+
+print(effects_sum)
+
+# Choose tidy log-scale breaks that read well on slides/paper
+x_breaks <- c(0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4)
+
+# Add a little padding so CI bars do not hit the edges
+x_min <- min(effects_sum$lo, na.rm = TRUE) * 0.85
+x_max <- max(effects_sum$hi, na.rm = TRUE) * 1.15
+
+p_forest <- ggplot(effects_sum, aes(y = Effect, x = OR_med)) +
+  # Reference line at no effect
+  geom_vline(xintercept = 1, linetype = "22", linewidth = 0.6, colour = "grey35") +
+  # Credible intervals
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.20, linewidth = 0.9, colour = "grey15") +
+  # Point estimate
+  geom_point(size = 3.2, shape = 21, stroke = 0.9, fill = "white", colour = "grey10") +
+  # Text label with OR and interval (placed to the right of the CI)
+  geom_text(
+    aes(x = pmin(hi * 1.08, x_max), label = label),
+    hjust = 0, size = 3.6, colour = "grey10"
+  ) +
+  scale_x_log10(
+    breaks = x_breaks,
+    labels = x_breaks,
+    limits = c(x_min, x_max)
+  ) +
+  labs(
+    title = "What drives next-day acquisition in the coupled household model?",
+    subtitle = "Posterior odds ratios (median and 95% credible interval). Household amplification dominates.",
+    x = "Odds ratio (log scale)",
+    y = NULL,
+    caption = "Community exposure is measured once at baseline (days leaving the house in the previous week)."
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title.position = "plot",
+    axis.text.y = element_text(size = 12.5),
+    axis.text.x = element_text(size = 11.5),
+    axis.title.x = element_text(size = 12.5, margin = margin(t = 8)),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12.5, margin = margin(b = 10)),
+    plot.caption = element_text(size = 10.5, colour = "grey25", margin = margin(t = 10)),
+    axis.ticks.y = element_blank()
+  )
+
+p_forest
+
+# Save high-res for slides/paper
+out_png <- file.path(fig_dir, "forest_modelK_effects_pubready.png")
+ggsave(out_png, plot = p_forest, width = 11.5, height = 5.2, dpi = 400, bg = "white")
+message("Saved: ", out_png)
+
+
+```
+
+```{r}
+# ---- Publication-ready forest plot with semantic colour (no refit) ----
+
+library(tidyverse)
+library(posterior)
+library(ggplot2)
+library(here)
+
+# Paths
+rds_path <- here("outputs", "rds", "draws_K_df.rds")
+fig_dir  <- here("outputs", "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+stopifnot(file.exists(rds_path))
+
+# Load posterior draws
+draws <- readRDS(rds_path) |>
+  posterior::as_draws_df() |>
+  as_tibble()
+
+# Summarise effects on intuitive scales
+effects_sum <- draws |>
+  transmute(
+    Effect = c(
+      "Household amplification\n(per additional infected household member yesterday)",
+      "Community exposure\n(leaving house every day vs never)",
+      "Community exposure\n(per additional day leaving the house)",
+      "Household environment\n(environmental contamination positive vs negative)"
+    ),
+    OR = list(
+      exp(beta_hh),
+      exp(beta_comm),
+      exp(beta_comm / 7),
+      exp(beta_env)
+    )
+  ) |>
+  unnest(OR) |>
+  group_by(Effect) |>
+  summarise(
+    OR_med = median(OR),
+    lo     = quantile(OR, 0.025),
+    hi     = quantile(OR, 0.975),
+    .groups = "drop"
+  ) |>
+  mutate(
+    label = sprintf("%.2f  [%.2f to %.2f]", OR_med, lo, hi),
+    mechanism = case_when(
+      str_detect(Effect, "Household amplification") ~ "Household transmission",
+      str_detect(Effect, "Community exposure")      ~ "Community exposure",
+      TRUE                                          ~ "Environment"
+    ),
+    Effect = factor(
+      Effect,
+      levels = c(
+        "Household amplification\n(per additional infected household member yesterday)",
+        "Community exposure\n(leaving house every day vs never)",
+        "Community exposure\n(per additional day leaving the house)",
+        "Household environment\n(environmental contamination positive vs negative)"
+      )
+    )
+  )
+
+# Colour palette (Okabe–Ito inspired; colour-blind safe)
+cols <- c(
+  "Household transmission" = "#0072B2",  # blue
+  "Community exposure"     = "#D55E00",  # orange
+  "Environment"            = "#666666"   # grey
+)
+
+# Axis limits with padding
+x_min <- min(effects_sum$lo) * 0.85
+x_max <- max(effects_sum$hi) * 1.15
+
+p_forest <- ggplot(effects_sum, aes(y = Effect, x = OR_med, colour = mechanism)) +
+  # No-effect line
+  geom_vline(xintercept = 1, linetype = "22", linewidth = 0.6, colour = "grey40") +
+  # Credible intervals
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.22, linewidth = 1.0) +
+  # Point estimates
+  geom_point(size = 3.6, shape = 16) +
+  # Numeric labels
+  geom_text(
+    aes(x = pmin(hi * 1.08, x_max), label = label),
+    hjust = 0, size = 3.7, colour = "black"
+  ) +
+  scale_colour_manual(values = cols) +
+  scale_x_log10(
+    breaks = c(0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4),
+    labels = c("0.5","0.75","1","1.25","1.5","2","3","4"),
+    limits = c(x_min, x_max)
+  ) +
+  labs(
+    title = "What drives next-day Salmonella acquisition within households?",
+    subtitle = "Posterior odds ratios from the coupled household model (median and 95% credible intervals)",
+    x = "Odds ratio (log scale)",
+    y = NULL,
+    colour = NULL,
+    caption = "Community exposure is measured at baseline (days leaving the house in the prior week)."
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12.5, margin = margin(b = 10)),
+    axis.text.y = element_text(size = 12.5),
+    axis.text.x = element_text(size = 11.5),
+    axis.title.x = element_text(size = 12.5, margin = margin(t = 8)),
+    legend.position = "top",
+    plot.caption = element_text(size = 10.5, colour = "grey30", margin = margin(t = 10))
+  )
+
+p_forest
+
+# Save high-resolution output
+out_png <- file.path(fig_dir, "forest_modelK_effects_colour_pubready.png")
+ggsave(out_png, plot = p_forest, width = 11.5, height = 5.3, dpi = 400, bg = "white")
+message("Saved: ", out_png)
+
+```
+
+```{r}
+
+# ---- Publication-ready forest plot: coupled household model covariate effects ----
+
+library(tidyverse)
+library(posterior)
+library(ggplot2)
+library(here)
+
+# Paths
+rds_path <- here("outputs", "rds", "draws_K_df.rds")
+fig_dir  <- here("outputs", "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+stopifnot(file.exists(rds_path))
+
+# Load posterior draws
+draws <- readRDS(rds_path) |>
+  posterior::as_draws_df() |>
+  as_tibble()
+
+# Check required posterior parameters are present
+required_params <- c("beta_hh", "beta_comm", "beta_env")
+missing_params <- setdiff(required_params, names(draws))
+
+if (length(missing_params) > 0) {
+  stop(
+    "Missing required posterior parameter(s): ",
+    paste(missing_params, collapse = ", ")
+  )
+}
+
+# -------------------------------------------------------------------------
+# Assumption:
+# beta_comm represents the model coefficient for leaving the house every day
+# versus never leaving the house across the 7-day period.
+#
+# If beta_comm was instead fitted to the raw number of days out, then the
+# 7 days vs 0 days contrast should be exp(beta_comm * 7), not exp(beta_comm).
+# -------------------------------------------------------------------------
+
+effects_long <- draws |>
+  transmute(
+    `Household infection burden\nper additional infected member` =
+      exp(beta_hh),
+
+    `Mobility outside household\n7 days vs 0 days` =
+      exp(beta_comm),
+
+    `Baseline household contamination\npositive vs negative` =
+      exp(beta_env)
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "Effect",
+    values_to = "OR"
+  )
+
+# Desired visual order: top to bottom
+plot_order <- c(
+  "Household infection burden\nper additional infected member",
+  "Mobility outside household\n7 days vs 0 days",
+  "Baseline household contamination\npositive vs negative"
+)
+
+# Summarise posterior
+effects_sum <- effects_long |>
+  group_by(Effect) |>
+  summarise(
+    OR_med = median(OR),
+    lo     = quantile(OR, 0.025),
+    hi     = quantile(OR, 0.975),
+    .groups = "drop"
+  ) |>
+  mutate(
+    estimate_label = sprintf("%.2f [%.2f to %.2f]", OR_med, lo, hi),
+
+    # ggplot places the first y-level at the bottom,
+    # so reverse the levels to get the desired top-to-bottom order.
+    Effect = factor(Effect, levels = rev(plot_order))
+  )
+
+# Muted Lancet-style colours
+# These are taken from the Lancet-style palette family but avoid a primary-colour look.
+lancet_cols <- c(
+  "Household infection burden\nper additional infected member" = "#00468B",
+  "Mobility outside household\n7 days vs 0 days"               = "#0099B4",
+  "Baseline household contamination\npositive vs negative"     = "#925E9F"
+)
+
+# Log-scale axis limits with room for right-hand estimate labels
+x_values <- c(effects_sum$lo, effects_sum$hi, 1)
+
+log_range <- range(log10(x_values), na.rm = TRUE)
+pad <- diff(log_range) * 0.15
+
+if (!is.finite(pad) || pad == 0) {
+  pad <- 0.15
+}
+
+x_left  <- 10^(log_range[1] - pad)
+
+# Position of numerical labels
+x_text  <- 10^(log_range[2] + pad * 1.15)
+
+# Keep the plotting area elegant, but allow space for labels using clip = "off"
+x_limit <- 10^(log_range[2] + pad * 2.70)
+
+x_breaks <- c(1, 2, 4)
+x_breaks <- x_breaks[x_breaks >= x_left & x_breaks <= x_limit]
+
+# Plot
+p_forest <- ggplot(
+  effects_sum,
+  aes(y = Effect, x = OR_med)
+) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "22",
+    linewidth = 0.65,
+    colour = "grey45"
+  ) +
+
+  # Credible interval bars
+  geom_segment(
+    aes(
+      x = lo,
+      xend = hi,
+      y = Effect,
+      yend = Effect,
+      colour = Effect
+    ),
+    linewidth = 1.85,
+    lineend = "round"
+  ) +
+
+  # Posterior median points
+  geom_point(
+    aes(fill = Effect),
+    shape = 21,
+    size = 5.7,
+    colour = "white",
+    stroke = 0.95
+  ) +
+
+  # Right-hand posterior summaries
+  geom_text(
+    data = effects_sum,
+    aes(
+      y = Effect,
+      x = x_text,
+      label = estimate_label
+    ),
+    inherit.aes = FALSE,
+    hjust = 0,
+    size = 4.45,
+    colour = "black"
+  ) +
+
+  scale_colour_manual(values = lancet_cols) +
+  scale_fill_manual(values = lancet_cols) +
+
+  scale_x_log10(
+    breaks = x_breaks,
+    limits = c(x_left, x_limit),
+    labels = function(x) format(x, trim = TRUE, scientific = FALSE)
+  ) +
+
+  coord_cartesian(clip = "off") +
+
+  labs(
+    x = "Posterior odds ratio for acquisition",
+    y = NULL
+  ) +
+
+  theme_classic(base_size = 15.5) +
+  theme(
+    legend.position = "none",
+
+    axis.line.y  = element_blank(),
+    axis.ticks.y = element_blank(),
+
+    axis.line.x = element_line(
+      linewidth = 0.65,
+      colour = "black"
+    ),
+
+    axis.ticks.x = element_line(
+      linewidth = 0.65,
+      colour = "black"
+    ),
+
+    axis.text.y = element_text(
+      size = 16.5,
+      lineheight = 1.10,
+      colour = "black"
+    ),
+
+    axis.text.x = element_text(
+      size = 14.5,
+      colour = "black"
+    ),
+
+    axis.title.x = element_text(
+      size = 16.5,
+      margin = margin(t = 11)
+    ),
+
+    plot.background = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+
+    plot.margin = margin(10, 215, 10, 10)
+  )
+
+p_forest
+
+# Save source data
+write_csv(
+  effects_sum |>
+    mutate(
+      Effect = as.character(Effect),
+      statistic = "posterior median and 95% credible interval"
+    ),
+  file.path(fig_dir, "forest_modelK_effects_source_data.csv")
+)
+
+# Save figure
+out_png <- file.path(fig_dir, "forest_modelK_effects_lancet_colour.png")
+out_pdf <- file.path(fig_dir, "forest_modelK_effects_lancet_colour.pdf")
+
+ggsave(
+  out_png,
+  plot = p_forest,
+  width = 14.7,
+  height = 5.25,
+  dpi = 500,
+  bg = "white"
+)
+
+pdf_device <- if (capabilities("cairo")) cairo_pdf else "pdf"
+
+ggsave(
+  out_pdf,
+  plot = p_forest,
+  device = pdf_device,
+  width = 14.7,
+  height = 5.25,
+  bg = "white"
+)
+
+message("Saved: ", out_png)
+message("Saved: ", out_pdf)
+
+
+
+
+```
+
+## 13. Plotting chunk of within-house acquisition pressure
+
+```{r}
+# ---- Figure 1: acquisition probability by household infection pressure ----
+# No annotation; clearer percentage labels
+# Output: outputs/figures/Figure1_acquisition_probability_household_pressure_clean.png
+
+library(tidyverse)
+library(posterior)
+library(ggplot2)
+library(here)
+library(scales)
+
+fig_dir <- here("outputs", "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Load posterior draws
+draws_K <- readRDS(here("outputs", "rds", "draws_K_df.rds")) |>
+  posterior::as_draws_df() |>
+  as_tibble()
+
+stopifnot(all(c("alpha_SI", "beta_hh") %in% names(draws_K)))
+
+# Posterior-predicted acquisition probabilities
+# Scenario: environmentally negative household, reference mobility, household frailty = 0
+acq_pressure_draws <- draws_K |>
+  dplyr::select(alpha_SI, beta_hh) |>
+  tidyr::crossing(n_infected_previous = 0:3) |>
+  dplyr::mutate(
+    p_acquisition = plogis(alpha_SI + beta_hh * n_infected_previous)
+  )
+
+acq_pressure_summary <- acq_pressure_draws |>
+  group_by(n_infected_previous) |>
+  summarise(
+    median = median(p_acquisition, na.rm = TRUE),
+    lo     = quantile(p_acquisition, 0.025, na.rm = TRUE),
+    hi     = quantile(p_acquisition, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    median_pct = 100 * median,
+    lo_pct     = 100 * lo,
+    hi_pct     = 100 * hi,
+    label      = sprintf("%.1f%%", median_pct),
+    label_y    = case_when(
+      n_infected_previous == 0 ~ median_pct + 2.1,
+      n_infected_previous == 1 ~ median_pct + 2.1,
+      n_infected_previous == 2 ~ median_pct + 2.6,
+      n_infected_previous == 3 ~ median_pct + 3.6
+    )
+  )
+
+print(acq_pressure_summary)
+
+write_csv(
+  acq_pressure_summary,
+  here("outputs", "rds", "Figure1_acquisition_probability_household_pressure_clean.csv")
+)
+
+# Interpolated curve for a smooth visual connection
+curve_df <- tibble(
+  n_infected_previous = seq(0, 3, length.out = 200)
+) |>
+  mutate(
+    median_pct = approx(
+      x = acq_pressure_summary$n_infected_previous,
+      y = acq_pressure_summary$median_pct,
+      xout = n_infected_previous
+    )$y,
+    lo_pct = approx(
+      x = acq_pressure_summary$n_infected_previous,
+      y = acq_pressure_summary$lo_pct,
+      xout = n_infected_previous
+    )$y,
+    hi_pct = approx(
+      x = acq_pressure_summary$n_infected_previous,
+      y = acq_pressure_summary$hi_pct,
+      xout = n_infected_previous
+    )$y
+  )
+
+blue_main <- "#005EA8"
+blue_fill <- "#A6CEE3"
+grey_text <- "#202020"
+
+p_fig1_clean <- ggplot() +
+  geom_ribbon(
+    data = curve_df,
+    aes(
+      x = n_infected_previous,
+      ymin = lo_pct,
+      ymax = hi_pct
+    ),
+    fill = blue_fill,
+    alpha = 0.35
+  ) +
+  geom_line(
+    data = curve_df,
+    aes(x = n_infected_previous, y = median_pct),
+    colour = blue_main,
+    linewidth = 1.2,
+    lineend = "round"
+  ) +
+  geom_errorbar(
+    data = acq_pressure_summary,
+    aes(
+      x = n_infected_previous,
+      ymin = lo_pct,
+      ymax = hi_pct
+    ),
+    width = 0.07,
+    linewidth = 0.85,
+    colour = blue_main
+  ) +
+  geom_point(
+    data = acq_pressure_summary,
+    aes(x = n_infected_previous, y = median_pct),
+    size = 4.0,
+    colour = blue_main,
+    fill = "white",
+    shape = 21,
+    stroke = 1.25
+  ) +
+  geom_label(
+    data = acq_pressure_summary,
+    aes(
+      x = n_infected_previous,
+      y = label_y,
+      label = label
+    ),
+    size = 4.4,
+    fontface = "bold",
+    colour = grey_text,
+    fill = "white",
+    label.size = 0,
+    label.padding = unit(0.13, "lines")
+  ) +
+  scale_x_continuous(
+    breaks = 0:3,
+    limits = c(-0.25, 3.25),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 45, by = 5),
+    limits = c(0, 45),
+    labels = label_number(suffix = "%"),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = "Household infection pressure strongly increases acquisition",
+    subtitle = "Posterior-predicted daily acquisition probability in an environmentally negative household at reference mobility",
+    x = "Latently infected household members at previous time step",
+    y = "Daily probability of acquisition",
+    caption = "Points show posterior medians; vertical bars and shaded band show 95% credible intervals."
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title.position = "plot",
+    plot.caption.position = "plot",
+
+    plot.title = element_text(
+      face = "bold",
+      size = 17,
+      colour = "black",
+      margin = margin(b = 6)
+    ),
+    plot.subtitle = element_text(
+      size = 11.5,
+      colour = "grey25",
+      margin = margin(b = 16)
+    ),
+    plot.caption = element_text(
+      size = 9.5,
+      colour = "grey35",
+      margin = margin(t = 12)
+    ),
+
+    axis.title.x = element_text(
+      size = 12,
+      colour = "black",
+      margin = margin(t = 10)
+    ),
+    axis.title.y = element_text(
+      size = 12,
+      colour = "black",
+      margin = margin(r = 10)
+    ),
+    axis.text = element_text(
+      size = 11,
+      colour = "black"
+    ),
+
+    axis.line = element_line(linewidth = 0.55, colour = "black"),
+    axis.ticks = element_line(linewidth = 0.45, colour = "black"),
+    axis.ticks.length = unit(0.18, "cm"),
+
+    panel.grid.major.y = element_line(
+      colour = "grey88",
+      linewidth = 0.35
+    ),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+
+    plot.margin = margin(t = 14, r = 24, b = 12, l = 14)
+  )
+
+p_fig1_clean
+
+out_png <- here(
+  "outputs",
+  "figures",
+  "Figure1_acquisition_probability_household_pressure_clean.png"
+)
+
+ggsave(
+  filename = out_png,
+  plot = p_fig1_clean,
+  width = 8.8,
+  height = 5.8,
+  dpi = 300,
+  bg = "white"
+)
+
+message("Saved: ", out_png)
+```

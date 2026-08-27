@@ -1,0 +1,1328 @@
+---
+title: "Bayesian Model A: individual hidden Markov model"
+format:
+  html:
+    toc: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: source
+---
+
+# Overview
+
+Model A is a two-state susceptible–infected hidden Markov model for daily PCR observations. A sampled day is represented either by no amplification or by an observed Ct value. State-specific amplification probabilities and Gaussian Ct distributions distinguish the latent susceptible and infected states, while the latent process follows a daily SIS transition model.
+
+The workflow reads the daily-grid modelling input, compiles the accompanying Stan program, fits the model, and generates posterior summaries and derived epidemiological quantities. Priors and sampler settings are specified explicitly below.
+
+## i. The model's premise:
+
+On each given day, the participant is in one of two latent biological states
+
+-   S = not infected / not shedding
+
+-   I - infected / shedding
+
+The QUESTION the model is asking is: *"if I knew which biological state the participant was in on that day, how likely would each type of PCR outcome be?"*
+
+## ii. The model's OBSERVATION:
+
+The OBSERVATION is:
+
+Either:
+
+1.  "no Ct" (no amplification / not detected)
+
+Or:
+
+2.  a numeric Ct value.
+
+This is not the same as what we had previously, where the observation was a numeric Ct value that could be present or absent... this is a categorical-numeric hybrid observation: either *nothing* was detected or a *number* was detected.
+
+We use the "empty set" (in latex \varnothing) notation for this: $\varnothing$
+
+So when we see $\varnothing$ it means "no Ct value was observed". For example:
+
+$$y_t = \varnothing$$
+
+means "On day $t$, the PCR result was no Ct"
+
+The mathematical notation for encoding the observation is as follows:
+
+$$
+y_t \in \{\varnothing\} \cup \mathbb{R}
+$$
+
+This means:
+
+The observation at time $t$
+
+$$
+y_t
+$$
+
+Is an element of
+
+$$
+\in
+$$
+
+The empty set
+
+$$
+\{\varnothing\}
+$$
+
+or
+
+$$
+\cup
+$$
+
+a real number
+
+$$
+\mathbb{R}
+$$
+
+Three examples to illustrate this:
+
+| Day $t$ | PCR machine output | $y_t$                       |
+|---------|--------------------|-----------------------------|
+| 2       | Ct = 22.6          | $y_2 = 22.6 \in \mathbb{R}$ |
+| 4       | PCR negative       | $y_4 = \varnothing$         |
+| 6       | Ct = 37.9          | $y_2 = 37.9 \in \mathbb{R}$ |
+
+## iii. The latent state
+
+Let:
+
+$$
+Z_{i,t} \in \{S, I\}
+$$
+
+-   $S$ : not infected
+
+-   $I$: infected
+
+## iv. biological statement
+
+For each state $\{S, I\}$ :
+
+1.  PCR may or may not detect a TTR target DNA amplification
+2.  Only if amplification occurs do we see a Ct value
+3.  The Ct value has a distribution (depending on the state).
+
+This means emissions are a two-stage process (detection / Ct value)
+
+## v. Detection probabilities
+
+-   $\phi_I$: sensitivity
+
+-   $\phi_S$: false positive probability
+
+$$
+\phi_I = P(D_t = 1 \mid Z_t = I)
+$$
+
+$$
+\phi_S = P(D_t = 1 \mid Z_t = S)
+$$
+
+Where $D_t$ is "\[PCR\] detection at time t"
+
+and $Z_t$ is "state at time t"
+
+## vi. Probability of no Ct
+
+If no DNA amplification is detected, the observed outcome is $\varnothing$
+
+The probability of which is:
+
+-   In the susceptible state:
+
+    $$
+    P(y_t = \varnothing | Z_t = S) = 1 - \phi_S
+    $$
+
+-   In the infected state
+
+    $$
+    P(y_t = \varnothing | Z_t = I) = 1-\phi_I
+    $$
+
+## vii. Probability of a Ct value
+
+Where a Ct value is observed, it can only happen if a detection has occurred, which means that the probability of seeing a Ct value has two components:
+
+1.  probability that detection happened
+2.  that the Ct took that value
+
+The probability of which is:
+
+-   In the susceptible state:
+
+    $$
+    p(y_t = c_t | Z_t = S) = \phi_S \mathcal{N}(C_t | \mu_S, \sigma_S)
+    $$
+
+-   In the infected state:
+
+    $$
+    p(y_t = c_t | Z_t = I) = \phi_I \mathcal{N}(C_t | \mu_I, \sigma_I)
+    $$
+
+$\mathcal{N}$ = the Gaussian distribution
+
+$c_t$ = Ct value
+
+$\mu_S, \mu_I$ = mean Ct values (S and I state)
+
+$p$ is lowercase because this is a density not a probability mass (Ct is continuous and can be any number from 0 to infinity and anything in between, so it is a mass not a discrete probability, unlike PCR negative or positive!)
+
+## viii. Emission model summary
+
+-   Susceptible state:
+
+    $$
+    P(y_t \mid Z_t = S) =\begin{cases}1 - \phi_S, & y_t = \varnothing, \\\phi_S \, \mathcal{N}\!\left(y_t \mid \mu_S, \sigma_S\right), & y_t \in \mathbb{R}\end{cases}
+    $$
+
+In words (S state):
+
+*"With probability* $1 - \phi_S$ *no amplification is detected; with probability* $\phi_S$*, amplification occurs, and the observed Ct value is drawn from a Normal distribution with mean* $\mu_S$ *and standard deviation* $\sigma_S$*."*
+
+-   Infected state:
+
+    $$
+    P(y_t \mid Z_t = I) =\begin{cases}1 - \phi_I, & y_t = \varnothing, \\\phi_I \, \mathcal{N}\!\left(y_t \mid \mu_I, \sigma_I\right), & y_t \in \mathbb{R}\end{cases}
+    $$
+
+    In words (I state)
+
+    With probability $1-\phi_I$, no amplification is detected; with probability $\phi_I​$, amplification occurs and the observed Ct value is drawn from a Normal distribution with mean $\mu_I$ and standard deviation $\sigma_1$
+
+    ## ix. Time index and latent state process.
+
+    $i = 1,...,N_{subjects}$ (1:336 index participants)
+
+    $t = 1,...,T_i$ (index days within each individual $i$)
+
+    [Initial state distribution]{.underline}
+
+    $$
+    P(Z_{i,1} = I) = \pi_I,\quad P(Z_{i,1} = S) = 1- \pi_I.
+    $$
+
+    where, $\pi_I$ is the probability of the infected state (here at the start of follow-up). So in words.
+
+    *"The probability that subject* $i$ is in the infected state at $t=1$ is $\pi_I$"
+
+    *"The probability of subject* $i$ *being susceptible at* $t=1$ is $1-\pi_I"$
+
+    Even more simply, before I observe any Ct values, I still have to say what fraction of people I believe to be infected at the start of follow-up. Where $\pi_I$ is large, this is many people; where it is small, it is few people.
+
+## x. SIS transition model
+
+Let:
+
+$$
+p_{SI} = P(Z_{i,t+1} | Z_{i,t} = S), \quad p_{IS} = P(Z_{i,t,+1} = S | Z_{i,t} = I).
+$$
+
+*"The transition probability* $p_{SI}$ *is defined as the probability that subject* $i$ *is in the infected state at time* $t+1$*, given that they were in the susceptible state at time* $t$*"*
+
+and
+
+*"The transition probability* $p_{IS}$ *is defined as the probability that subject* $i$ *is in the susceptible state at time* $t+1$*, given that they were in the infected state at time* $t$*"*
+
+Then for $t-1,..., T_i - 1$:
+
+$$
+P(Z_{i,t+1} = I | Z_{i,t} = S) = p_{SI}, \quad P(Z_{i,t+1} = S | Z_{i,t} = S) = 1 - p_{SI},\\ P(Z_{i,t+1} = S | Z_{i,t} = I) = p_{IS}, \quad P(Z_{i,t+1} = I | Z_{i,t} = I) = 1 - p_{IS}.
+$$
+
+And written as a transition matrix in state order $S,I$:
+
+$$
+\mathbf{T} =\begin{pmatrix}1 - p_{SI} & p_{SI} \\p_{IS} & 1 - p_{IS}\end{pmatrix}.
+$$
+
+## xi. Full joint likelihood
+
+Now we join the state transition probabilities with the emission probabilities.
+
+-   $R_{i,t}$ : whether a PCR test was performed at time $t$ (remembering that there are missing samples).
+
+-   $D_{i,t}$: Ct value detected $D_{i,t} = 1$ or not detected $D_{i,t} = 0$
+
+-   $O_i$ : is the set of observed (sampled) times for individual $i$
+
+So the observation indicator is:
+
+$$
+R_{i,t} =\left\{\begin{array}{ll}1 & \text{if sampled at time } t \\0 & \text{otherwise}\end{array}\right.
+$$
+
+The set of observed days is:
+
+$$
+O_i = \{t: R_{i,t} = 1\}
+$$
+
+*(The set of days on which individual* $i$ *actually gave a sample)*
+
+Observed data $y_{it}$ which may be either a Ct value ($\in \mathbb{R}$) or no amplification ($\varnothing$)
+
+Therefore the individual level joint probability is:
+
+$$
+p(Z_{i,1:T_i},y_i, O_i)
+$$
+
+*Which means: "The probability that individual* $i$ *had a particular entire infection history AND produced the observations we saw on the days that we sampled them*
+
+*This is the [likelihood contribution of one person.]{.underline}*
+
+### *The full expression*
+
+### 
+
+$$
+p(Z_{i,1:T_i},y_i,O_i) = p(Z_{i,1}) \prod*{t=1}^{{T_1} -1} p(Z*{i,t+1} | Z_{i,t}) \prod_{t \in O_i} p(y{i,t} | Z_{i,t})
+$$
+
+### Breaking it down:
+
+#### A. Initial state
+
+-   the probability that individual $i$ starts in state $S$ or $I$:
+
+    $$
+    P(Z_{i,1} = I) = \pi_I
+    $$
+
+(this is where we derive $\pi_i$ from)
+
+#### B. State evolution over time
+
+-   Multiply together the probabilities of ever day-to-day transition in the person's latent infection history
+
+    $$
+    \prod_{t=1}^{T_{i} - 1} p(Z_{i,t,+1} | Z_{i,t})
+    $$
+
+For example, let's say latent infection history had been: S-S; S:I; I:I; I:S... each step uses $p_{SI}, p_{I,S}$
+
+The product of this builds the probability of the entire latent trajectory.
+
+#### C. Observation model (only when sampled, though!)
+
+$$
+\prod_{t \in O_i} p(y_{i,t} | Z_{i,t})
+$$
+
+This says:
+
+*"if the person was in state* $Z_{i,t}$, how likely is the observed Ct (or non-detection)?
+
+#### D. Putting it together
+
+for one person, this model says:
+
+1.  They start in either $S$ or $I$
+2.  Their state evolves day by day via the SIS process
+3.  On days where I sampled them, their latent state generates the observed data (Ct or no amplification)
+
+We assume here that individuals are conditionally independent, therefore the total likelihood is the product of each person's likelihood.
+
+#### E. Across individuals
+
+-   Here we assume conditional independence:
+
+    $$
+    p(Z,y) = \prod_{i=1}^{N_{subj}} p(Z_{i,1:T{_i}}, y_i, O_i).
+    $$
+
+### xii. Parameters (on the logit scale)
+
+In the model, some of the parameters are probabilities. E.g. probability of recovering today...
+
+The rule of probabilities is:
+
+$$
+0 ≤ p ≤ 1
+$$
+
+Probabilities can never be negative and never be bigger than one.
+
+When the model is exploring parameter space it does so by proposing new values and moving freely in all directions, but the probability is in "a box with walls":
+
+0 ├────────────── p ──────────────┤ 1
+
+This means that the sampler bumps into boundaries and sampling is inefficient.
+
+The key concept is that instead of working on the 0:1 space, we use the logit, which represents it
+
+$$
+\alpha = \log\!\left(\frac{p}{1 - p}\right)
+$$
+
+The logit stretches 0 and 1 out to the whole number line:
+
+| probability $p$ | Logit $\alpha$ |
+|-----------------|----------------|
+| 0.01            | -4.6           |
+| 0.1             | -2.2           |
+| 0.5             | 0              |
+| 0.9             | +2.2           |
+| 0.99            | +4.6           |
+
+Mathematically:
+
+$$
+\alpha \in (-\infty, + \infty)
+$$
+
+So now there are now boundaries in what stan can sample from.
+
+### xiii. Expressing probabilities as logits.
+
+Since we are using the logit scale, we need to rewrite our parameters
+
+$$
+logit(p_{SI}) = \alpha_{SI}, \quad logit(p_{IS}) = \alpha_{IS}, \quad logit(\pi_I) = \alpha_{\pi}, \\ logit(\phi_I) = \alpha_{\phi I}, \quad logit(\phi_S) = \alpha_{\phi_S}.
+$$
+
+### xiv. Defining our priors
+
+Table \[x\]. Prior specification and interpretation for the Bayesian SIS hidden Markov model. Transition, initial state, and detection parameters are modelled on the logit scale; Ct distribution parameters are modelled on the natural Ct scale.
+
+| Stan parameter | Scale prior is placed on | Implied model quantity | Prior specification | Biological interpretation |
+|---------------|---------------|---------------|---------------|---------------|
+| α_SI | Logit scale | p_SI = logit⁻¹(α_SI) | α_SI \~ Normal(logit(0.01), 0.7) | Daily infection hazard: probability of transitioning from susceptible to infected between consecutive days. Larger values imply more frequent new infections. |
+| α_IS | Logit scale | p_IS = logit⁻¹(α_IS) | α_IS \~ Normal(logit(0.17), 0.5) | Daily recovery hazard: probability of clearing infection. Controls expected infection duration (approximately 1 / p_IS days). |
+| α_π | Logit scale | π_I = logit⁻¹(α_π) | α_π \~ Normal(logit(0.063), 0.4) | Baseline prevalence: probability an individual is infected at the first observed day of follow-up. |
+| α_ϕI | Logit scale | ϕ_I = logit⁻¹(α_ϕI) | α_ϕI \~ Normal(logit(0.75), 0.35) | PCR sensitivity: probability of observing a Ct value on a sampled day given true infection. |
+| α_ϕS | Logit scale | ϕ_S = logit⁻¹(α_ϕS) | α_ϕS \~ Normal(logit(0.005), 0.8) | False positive probability: probability of observing a Ct value on a sampled day when uninfected (e.g. contamination or late-cycle amplification). |
+| μ_I | Natural Ct scale | Used directly | μ_I \~ Normal(28, 2), constrained to \[10, 45\] | Mean Ct value in the infected state. Lower values correspond to higher pathogen load and earlier amplification. |
+| μ_S | Natural Ct scale | Used directly | μ_S \~ Normal(40, 2), constrained to \[μ_I + 0.5, 45\] | Mean Ct value in the susceptible state, representing background or spurious amplification. Constraint enforces separation from infected Ct values. |
+| σ_I | Natural Ct scale (positive) | Used directly | σ_I \~ Normal(4, 0.5), truncated to \[1, 6\] | Variability of Ct values in the infected state. Larger values imply greater heterogeneity in pathogen load. |
+| σ_S | Natural Ct scale (positive) | Used directly | σ_S \~ Normal(3, 0.5), truncated to \[1, 6\] | Variability of background Ct values when false detection occurs. Controls dispersion of noise Ct values. |
+
+### Priors (in prose!)
+
+$α_{SI}​∼N(logit(0.01),0.7)$
+
+This prior says that new infections are uncommon on any given day (about 1% per day on average), but I’m quite unsure about the exact rate and I’m happy for the data to move it by a few-fold in either direction.
+
+$α{IS}∼N(logit(0.17),0.5)$
+
+This says that once someone is infected they usually clear infection over several days rather than immediately, with a typical daily recovery chance around 17%, but with room for shorter or longer infections if the data support it.
+
+$α_π​∼N(logit(0.063),0.4)$
+
+This encodes a belief that only a small minority of people are already infected at the start of follow-up (around 6%), while allowing some uncertainty about the true baseline prevalence.
+
+$α_{ϕ_I}​∼N(logit(0.75),0.35)$
+
+This reflects the idea that PCR usually detects infection when someone is truly infected, but not perfectly, and allows for a reasonable amount of uncertainty in sensitivity across days and individuals.
+
+$α_{ϕ_S}​∼N(logit(0.005),0.8)$
+
+This says that false positive Ct values should be very rare when someone is uninfected (around half a percent), but I’m deliberately uncertain by a factor of a few because contamination and late-cycle noise do occasionally happen.
+
+$μ_I​∼N(28,2)$ constrained to \[10, 45\]
+
+This says that true infections tend to produce mid-range Ct values centred around 28, while ruling out implausibly low or high Ct means that would not make biological or laboratory sense.
+
+$μ_S​∼N(40,2)$, constrained to $μ_S ​≥ μ_I​+0.5$
+
+This encodes that background or spurious amplification, when it occurs, tends to appear very late in the PCR run, and I explicitly force it to sit above the infected Ct regime so the two states can’t swap roles.
+
+$σ_I​∼N(, 4,0.5)$ ,truncated to \[1, 6\]
+
+This allows moderate variability in Ct values among infected observations, reflecting heterogeneity in bacterial load, but prevents the model inventing unrealistically tight or wildly diffuse infected Ct distributions.
+
+$σ_S​∼N(3,0.5)$ truncated to \[1, 6\]
+
+This assumes that false positive Ct values cluster fairly tightly around a high Ct mean, while still allowing some spread, and stops the noise distribution becoming pathological.
+
+## 1. Libraries
+
+```{r}
+library(tidyverse)
+library(here)
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(loo)
+library(patchwork)
+```
+
+## 2. Read in modelling dataframe (not Ct value filtering)
+
+```{r}
+pcr <- read_csv(here::here("data_clean", "HMM_ModelA_input_dailygrid.csv")) %>%
+  mutate(
+    has_obs = as.integer(has_obs),
+    has_ct  = as.integer(has_ct),
+    Ct      = if_else(has_ct == 1L, ct_value, 0)  # placeholder when no Ct
+  ) %>%
+  arrange(pid_id, collection_date, row)
+```
+
+## 3. Make ID table, define Ct max and list stan data
+
+```{r}
+
+
+idx_tbl_A <- pcr %>%
+  group_by(pid_id) %>%
+  summarise(
+    start = min(row),
+    end   = max(row),
+    .groups = "drop"
+  )
+
+Ct_max <- 45  # fixed detection limit
+
+stan_data_A <- list(
+  N         = nrow(pcr),
+  N_subj    = nrow(idx_tbl_A),
+  start_idx = idx_tbl_A$start,
+  end_idx   = idx_tbl_A$end,
+  has_obs   = as.array(pcr$has_obs),
+  has_ct    = as.array(pcr$has_ct),
+  Ct        = as.array(pcr$Ct),
+  Ct_max    = Ct_max
+)
+
+
+```
+
+## 4. Stan model
+
+```{r}
+stan_file_A <- here::here(
+  "bayesian_models", "stan", "model_A_individual_hmm.stan"
+)
+stopifnot(file.exists(stan_file_A))
+
+```
+
+## 5. Fit model A and extract parameter summaries
+
+```{r}
+
+logit <- function(p) log(p / (1 - p))
+
+init_fun <- function() {
+  list(
+    alpha_SI     = logit(0.01),
+    alpha_IS     = logit(0.17),
+    alpha_pi     = logit(0.063),
+
+    alpha_phi_I  = logit(0.75),
+    alpha_phi_S  = logit(0.005),
+
+    mu_I         = 28,
+    mu_S         = 40,
+    sigma_I      = 4,
+    sigma_S      = 3
+  )
+}
+
+mod_A <- cmdstan_model(stan_file_A, force_recompile = TRUE)
+
+fit_A <- mod_A$sample(
+  data            = stan_data_A,
+  init            = init_fun,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 2000,
+  iter_sampling   = 2000,
+  seed            = 2027,
+  refresh         = 200,
+  adapt_delta     = 0.95,
+  max_treedepth   = 12
+)
+
+
+
+# Summarise key parameters (using names that exist in Stan)
+
+
+pars_summary <- c(
+  # logits 
+  "alpha_SI", "alpha_IS", "alpha_pi",
+  "alpha_phi_I", "alpha_phi_S",
+
+  # probabilities on natural scale (transformed parameters)
+  "p_SI", "p_IS", "pi_I", "phi_I", "phi_S",
+
+  # Ct distribution parameters
+  "mu_I", "mu_S", "sigma_I", "sigma_S"
+)
+
+results_model_A <- fit_A$summary(pars_summary) %>%
+  dplyr::select(variable, mean, median, sd, q5, q95, rhat, ess_bulk, ess_tail)
+
+results_model_A
+
+
+
+```
+
+## 6. Extract posterior mean
+
+```{r}
+
+# Extract posterior draws and summarise to the mean per day
+prob_I_A <- fit_A$draws("prob_I", format = "draws_df") %>%
+  summarise(across(everything(), mean)) %>%
+  pivot_longer(
+    cols      = everything(),
+    names_to  = "var",
+    values_to = "prob_I"
+  ) %>%
+  mutate(
+    row = as.integer(gsub("prob_I\\[|\\]", "", var))
+  ) %>%
+  dplyr::select(row, prob_I)
+
+```
+
+## 7. Traceplots
+
+```{r}
+
+# Key parameters for traceplots
+pars_core <- c("p_SI", "p_IS", "pi_I", "mu_I", "mu_S", "sigma_I", "sigma_S")
+
+# Extract draws in matrix form (iterations x chains for each parameter)
+draws_core <- fit_A$draws(pars_core)
+
+# 1) Quick traceplots
+bayesplot::mcmc_trace(draws_core, pars = pars_core)
+
+#  separate panels for clarity:
+bayesplot::mcmc_trace(draws_core, pars = c("p_SI", "p_IS", "pi_I"))
+bayesplot::mcmc_trace(draws_core, pars = c("mu_I", "mu_S"))
+bayesplot::mcmc_trace(draws_core, pars = c("sigma_I", "sigma_S"))
+
+# 2) Rhat & ESS overview
+fit_A$summary(pars_core)[, c("variable", "mean", "sd", "rhat", "ess_bulk", "ess_tail")]
+
+```
+
+## 8. WAIC
+
+```{r}
+
+# draws in matrix form: iterations*chains rows, N_subj columns
+log_lik_mat <- fit_A$draws("log_lik_subj", format = "matrix")
+
+dim(log_lik_mat)
+# [1] n_draws   N_subj
+waic_A <- loo::waic(log_lik_mat)
+
+waic_A
+print(waic_A)
+
+# summary table
+waic_summary <- with(waic_A, 
+  tibble::tibble(
+    waic      = waic,
+    se_waic   = se_waic,
+    p_waic    = p_waic,
+    elpd_waic = elpd_waic,
+    se_elpd   = se_elpd_waic
+  )
+)
+waic_summary
+
+loo_A <- loo::loo(log_lik_mat)
+loo_A
+print(loo_A)
+
+
+```
+
+## 9. Model diagnostics
+
+```{r}
+# CmdStan sampler diagnostics summary
+fit_A$cmdstan_diagnose()
+
+# Inspect divergences / treedepth from draws
+draws <- fit_A$draws(variables = NULL)
+np <- fit_A$sampler_diagnostics()
+div <- np[, , "divergent__"]
+td  <- np[, , "treedepth__"]
+
+cat("Divergences:", sum(div), "\n")
+cat("Max treedepth hits:", sum(td >= 12), "\n")
+
+
+
+```
+
+## 10. Predictive plots
+
+### 10a. For one participant
+
+```{r}
+
+
+# 1. Join pcr and posterior infection probabilities -----------------------
+
+pcr_with_prob <- pcr %>%
+  left_join(prob_I_A, by = "row") %>%
+  mutate(
+    ct_value_num = suppressWarnings(as.numeric(ct_value)),
+    pcr_pos = if_else(
+      has_ct == 1L & !is.na(ct_value_num) & ct_value_num <= 37.1,
+      1,  # PCR positive
+      0   # PCR negative, no Ct, or Ct > 37.1
+    )
+  )
+
+# 2. Subset to participant T27970 and sort by date ------------------------
+
+predictive_plot_T27970 <- pcr_with_prob %>%
+  filter(pid == "T27970") %>%      
+  arrange(collection_date)
+
+summary(predictive_plot_T27970$prob_I)
+
+# 3. Plot: binary PCR positivity and prob_I -------------------------------
+
+plot_T27970 <- ggplot(predictive_plot_T27970, aes(x = collection_date)) +
+  
+  # Binary PCR positivity (1 = Ct <= 37.1, 0 = otherwise)
+  geom_point(
+    aes(y = pcr_pos),
+    colour = "firebrick",
+    size   = 3
+  ) +
+  
+  # Latent infection probability
+  geom_line(
+    aes(y = prob_I),
+    colour    = "steelblue",
+    linewidth = 1.1
+  ) +
+  
+  labs(
+    title = "Participant T27970 — PCR positivity (0/1) and inferred infection probability",
+    x     = "Collection date",
+    y     = "PCR positive (≤37.1) = 1   |   Negative / no Ct = 0"
+  ) +
+  
+  theme_bw() +
+  theme(
+    plot.title  = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+plot_T27970
+
+
+
+```
+
+### 10b. For ten participants (PCR cut off ≤ 37.1)
+
+In this chunk we define the PCR positives by our previously defined "cut of" of a Ct value of ≤ 37.1
+
+```{r}
+
+# 1. Join PCR dataframe with posterior probabilities
+
+
+pcr_with_prob <- pcr %>%
+  left_join(prob_I_A, by = "row") %>%
+  mutate(
+    ct_value_num = suppressWarnings(as.numeric(ct_value)),
+    pcr_pos = if_else(
+      has_ct == 1L & !is.na(ct_value_num) & ct_value_num <= 37.1,
+      1,  # PCR positive
+      0   # negative / no Ct
+    )
+  )
+
+
+# 2. We choose ten participants with at least one PCR positive to visualise
+
+
+ten_pids <- pcr_with_prob %>%
+  group_by(pid) %>%
+  summarise(
+    n_pos = sum(pcr_pos == 1),
+    n_obs = sum(has_obs == 1),
+    .groups = "drop"
+  ) %>%
+  filter(n_pos > 0) %>%
+  arrange(desc(n_pos), desc(n_obs)) %>%
+  slice_head(n = 10) %>%
+  pull(pid)
+
+ten_pids
+
+
+
+# 3. Define plotting function
+
+
+plot_predictive <- function(pid, data) {
+
+  df <- data %>%
+    filter(pid == !!pid) %>%
+    arrange(collection_date)
+
+  ggplot(df, aes(x = collection_date)) +
+    
+    # PCR positivity (0/1)
+    geom_point(
+      aes(y = pcr_pos),
+      size = 2.8,
+      colour = "firebrick"
+    ) +
+
+    # Latent infection probability
+    geom_line(
+      aes(y = prob_I),
+      linewidth = 1,
+      colour = "steelblue"
+    ) +
+
+    labs(
+      title = paste("Participant", pid),
+      x = "Date",
+      y = "PCR positive (Ct ≤ 37.1) = 1   |   Negative/no Ct = 0   +   P(Infected)"
+    ) +
+
+    theme_bw() +
+    theme(
+      plot.title  = element_text(size = 11, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    
+    coord_cartesian(ylim = c(0, 1))   # make everything visible on the same scale
+}
+
+
+# 4. Produce 10 plots and vertically stack them
+
+
+plot_list <- lapply(ten_pids, plot_predictive, data = pcr_with_prob)
+
+combined_plot_10 <- wrap_plots(plotlist = plot_list, ncol = 1)
+
+combined_plot_10
+
+#  save
+ggsave(
+  here::here("outputs", "figures", "predictive_10_participants.tiff"),
+  combined_plot_10,
+  device = "tiff",
+  dpi    = 600,
+  width  = 10,
+  height = 20,
+  bg     = "white"
+)
+
+```
+
+### 10c. Combined predictive plot with Ct values \> 37.1 displayed seperately
+
+```{r}
+
+
+# 1. Define updated plotting function where Ct value > 37.1 displayed separately
+
+
+plot_predictive_2 <- function(pid, data) {
+
+  df <- data %>%
+    filter(pid == !!pid) %>%
+    arrange(collection_date)
+
+  ggplot(df, aes(x = collection_date)) +
+
+    # PCR positive (Ct ≤ 37.1)
+    geom_point(
+      data = df %>% filter(has_ct == 1L, !is.na(ct_value_num), ct_value_num <= 37.1),
+      aes(y = 1),
+      size = 2.8,
+      colour = "firebrick"
+    ) +
+
+    # PCR amplification detected but Ct > 37.1
+    geom_point(
+      data = df %>% filter(has_ct == 1L, !is.na(ct_value_num), ct_value_num > 37.1),
+      aes(y = 1),
+      size = 2.8,
+      colour = "orange"
+    ) +
+
+    # Latent infection probability
+    geom_line(
+      aes(y = prob_I),
+      linewidth = 1,
+      colour = "steelblue"
+    ) +
+
+    labs(
+      title = paste("Participant", pid),
+      x = "Date",
+      y = "PCR: Ct ≤ 37.1 (red), Ct > 37.1 (orange)   +   P(Infected)"
+    ) +
+
+    theme_bw() +
+    theme(
+      plot.title  = element_text(size = 11, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    coord_cartesian(ylim = c(0, 1))
+}
+
+
+# 2. Produce and stack plots
+
+
+plot_list <- lapply(ten_pids, plot_predictive_2, data = pcr_with_prob)
+
+combined_plot_10 <- wrap_plots(plotlist = plot_list, ncol = 1)
+
+combined_plot_10
+
+
+# 3. Save
+
+
+ggsave(
+  here::here("outputs", "figures", "predictive_10_participants_ct_thresholds.tiff"),
+  combined_plot_10,
+  device = "tiff",
+  dpi    = 600,
+  width  = 10,
+  height = 20,
+  bg     = "white"
+)
+
+```
+
+## 11. Optimising priors for subsequent models
+
+```{r}
+# =========================================================
+# Model A → Prior-tuning diagnostics (end-to-end)
+# Prints the summaries we need to inform Model E priors
+# Assumes you already have: pcr_with_prob (as shown), with:
+# pid, collection_date, row, has_obs, has_ct, ct_value_num, pcr_pos, prob_I
+# =========================================================
+
+library(dplyr)
+library(lubridate)
+library(data.table)
+
+# --- 0) Quick structure sanity checks ------------------------------------
+cat("\n==================== 0) Sanity checks ====================\n")
+
+required_cols <- c(
+  "pid","collection_date","row","has_obs","has_ct",
+  "ct_value_num","pcr_pos","prob_I"
+)
+
+missing_cols <- setdiff(required_cols, names(pcr_with_prob))
+if (length(missing_cols) > 0) {
+  stop("pcr_with_prob is missing columns: ", paste(missing_cols, collapse = ", "))
+}
+
+cat("Rows:", nrow(pcr_with_prob), "\n")
+cat("Unique participants (pid):", dplyr::n_distinct(pcr_with_prob$pid), "\n")
+
+# --- 1) Sampling cadence and follow-up length ----------------------------
+cat("\n==================== 1) Sampling cadence by pid ====================\n")
+
+cadence_by_pid <- pcr_with_prob %>%
+  group_by(pid) %>%
+  summarise(
+    date_min = min(collection_date, na.rm = TRUE),
+    date_max = max(collection_date, na.rm = TRUE),
+    n_days_grid = n(),
+    n_obs = sum(has_obs == 1),
+    obs_rate = n_obs / n_days_grid,
+    median_gap_days_between_obs = {
+      d <- sort(unique(collection_date[has_obs == 1]))
+      if (length(d) < 2) NA_real_ else median(as.numeric(diff(d)), na.rm = TRUE)
+    },
+    .groups = "drop"
+  )
+
+print(summary(cadence_by_pid$obs_rate))
+cat("\nMedian gap (days) between observed tests (per pid):\n")
+print(summary(cadence_by_pid$median_gap_days_between_obs))
+
+cat("\nTop 10 pids by number of observed tests:\n")
+print(cadence_by_pid %>% arrange(desc(n_obs)) %>% slice_head(n = 10))
+
+# --- 2) Positivity rates on TESTED days only -----------------------------
+cat("\n==================== 2) Positivity on tested days (has_obs==1) ====================\n")
+
+positivity_overall <- pcr_with_prob %>%
+  filter(has_obs == 1) %>%
+  summarise(
+    n_tests = n(),
+    any_ct_rate = mean(has_ct == 1, na.rm = TRUE),
+    ct_le_37_rate = mean(pcr_pos == 1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(positivity_overall)
+
+cat("\nPositivity by pid (distribution):\n")
+positivity_by_pid <- pcr_with_prob %>%
+  filter(has_obs == 1) %>%
+  group_by(pid) %>%
+  summarise(
+    n_tests = n(),
+    any_ct_rate = mean(has_ct == 1),
+    ct_le_37_rate = mean(pcr_pos == 1),
+    .groups = "drop"
+  )
+
+print(summary(positivity_by_pid$any_ct_rate))
+print(summary(positivity_by_pid$ct_le_37_rate))
+
+# --- 3) Ct distribution among detected tests -----------------------------
+cat("\n==================== 3) Ct distribution among detected tests (has_obs==1 & has_ct==1) ====================\n")
+
+ct_dist <- pcr_with_prob %>%
+  filter(has_obs == 1, has_ct == 1) %>%
+  summarise(
+    n_ct = n(),
+    min = min(ct_value_num, na.rm = TRUE),
+    q25 = quantile(ct_value_num, 0.25, na.rm = TRUE),
+    median = median(ct_value_num, na.rm = TRUE),
+    mean = mean(ct_value_num, na.rm = TRUE),
+    q75 = quantile(ct_value_num, 0.75, na.rm = TRUE),
+    max = max(ct_value_num, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(ct_dist)
+
+cat("\nCt bins (detected tests only):\n")
+ct_bins <- pcr_with_prob %>%
+  filter(has_obs == 1, has_ct == 1) %>%
+  mutate(
+    ct_bin = case_when(
+      ct_value_num <= 30 ~ "<=30",
+      ct_value_num <= 37.1 ~ "30–37.1",
+      ct_value_num <= 40 ~ "37.1–40",
+      TRUE ~ "40–45"
+    )
+  ) %>%
+  count(ct_bin) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(match(ct_bin, c("<=30","30–37.1","37.1–40","40–45")))
+
+print(ct_bins)
+
+# --- 4) High Ct isolation vs clustering on TESTED days -------------------
+cat("\n==================== 4) High Ct runs on tested days (Ct > 37.1) ====================\n")
+
+dt <- as.data.table(pcr_with_prob)
+setorder(dt, pid, row)
+
+dt[, tested := (has_obs == 1)]
+dt[, any_ct := tested & (has_ct == 1)]
+dt[, high_ct := tested & (has_ct == 1) & !is.na(ct_value_num) & (ct_value_num > 37.1)]
+dt[, low_ct  := tested & (has_ct == 1) & !is.na(ct_value_num) & (ct_value_num <= 37.1)]
+dt[, no_ct   := tested & (has_ct == 0)]
+
+dt_tested <- dt[tested == TRUE,
+                .(pid, row, collection_date, ct_value_num, high_ct, low_ct, any_ct, no_ct, prob_I)]
+setorder(dt_tested, pid, row)
+
+# run-length encoding on tested days
+dt_tested[, run_id_high := rleid(high_ct), by = pid]
+high_runs <- dt_tested[high_ct == TRUE, .N, by = .(pid, run_id_high)]
+setnames(high_runs, "N", "run_len_tested_days")
+
+cat("\nSummary of high-Ct run length (in tested days):\n")
+print(summary(high_runs$run_len_tested_days))
+
+cat("\nHigh-Ct run length table:\n")
+print(table(high_runs$run_len_tested_days))
+
+high_run_summary <- high_runs[, .(
+  n_runs = .N,
+  prop_isolated = mean(run_len_tested_days == 1),
+  prop_clustered_ge2 = mean(run_len_tested_days >= 2)
+)]
+cat("\nHigh-Ct run summary:\n")
+print(high_run_summary)
+
+# --- 5) Proxy phi_I / phi_S using posterior prob_I thresholds ------------
+cat("\n==================== 5) Proxy detection rates using prob_I thresholds ====================\n")
+
+thr_I <- 0.8
+thr_S <- 0.2
+
+dt_tested[, infected_proxy := (prob_I >= thr_I)]
+dt_tested[, susceptible_proxy := (prob_I <= thr_S)]
+
+phi_I_proxy <- dt_tested[infected_proxy == TRUE, mean(any_ct)]
+phi_S_proxy <- dt_tested[susceptible_proxy == TRUE, mean(any_ct)]
+
+cat("Thresholds: infected_proxy prob_I >= ", thr_I, " ; susceptible_proxy prob_I <= ", thr_S, "\n", sep = "")
+cat("Proxy phi_I (P(any Ct | prob_I high)):", phi_I_proxy, "\n")
+cat("Proxy phi_S (P(any Ct | prob_I low )):", phi_S_proxy, "\n")
+
+cat("\nCt means conditional on proxy state (detected only):\n")
+muI_proxy <- dt_tested[infected_proxy == TRUE & any_ct == TRUE, mean(ct_value_num, na.rm = TRUE)]
+muS_proxy <- dt_tested[susceptible_proxy == TRUE & any_ct == TRUE, mean(ct_value_num, na.rm = TRUE)]
+cat("Proxy mu_I (detected, prob_I high):", muI_proxy, "\n")
+cat("Proxy mu_S (detected, prob_I low ):", muS_proxy, "\n")
+
+# --- 6) Episode-style summaries on DAILY grid using prob_I threshold -----
+cat("\n==================== 6) Proxy infected run lengths + episode start rate (daily grid) ====================\n")
+
+thr_run <- 0.5
+dt2 <- copy(dt)
+setorder(dt2, pid, row)
+
+dt2[, I_proxy := (prob_I >= thr_run)]
+dt2[, I_prev := shift(I_proxy, 1, type = "lag"), by = pid]
+
+# Run lengths (in daily rows)
+dt2[, I_run := rleid(I_proxy), by = pid]
+I_runs <- dt2[I_proxy == TRUE, .N, by = .(pid, I_run)]
+setnames(I_runs, "N", "run_len_days")
+
+cat("\nProxy infected run length (days) summary (thr_run = ", thr_run, "):\n", sep = "")
+print(summary(I_runs$run_len_days))
+
+cat("\nProxy infected run length table (days):\n")
+print(table(I_runs$run_len_days))
+
+# Episode start rate per S-day (daily grid)
+starts <- dt2[!is.na(I_prev) & I_prev == FALSE & I_proxy == TRUE, .N]$N
+S_days <- dt2[!is.na(I_prev) & I_prev == FALSE, .N]$N
+episode_start_rate <- starts / S_days
+
+cat("\nProxy episode start rate per susceptible day (daily grid):\n")
+cat("starts =", starts, " ; S_days =", S_days, " ; rate =", episode_start_rate, "\n")
+
+# --- 7) Short printed takeaways to guide prior choices -------------------
+cat("\n==================== 7) Takeaways to guide Model E priors ====================\n")
+cat("* any_ct_rate on tested days informs phi_I/phi_S mixture and overall detectability.\n")
+cat("* high-Ct run isolation vs clustering informs whether late Ct is mostly noise (phi_S up) or persistent I (p_IS down).\n")
+cat("* proxy run lengths (daily) inform plausible p_IS (duration ~ 1/p_IS).\n")
+cat("* proxy episode_start_rate informs plausible p_SI range (but not equal to any_ct_rate).\n")
+
+```
+
+## 12. Save everything here to pick up in script 18
+
+In script 18 I will change the priors to more closely align with the outputs of chunk \[11\] above.
+
+This chunk will save everything I need to quickly make "Model E" (which will be exactly as model A is, but with these modified priors)
+
+```{r}
+
+
+# --- directories ----------------------------------------------------------
+rds_dir <- here::here("outputs", "rds")
+fit_dir <- here::here("outputs", "fits")
+
+dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(fit_dir, showWarnings = FALSE, recursive = TRUE)
+
+# --- 12a) Save core state (lightweight; no big fit objects inside) --------
+state_17 <- list(
+  # core data layer
+  pcr         = pcr,
+  idx_tbl_A   = idx_tbl_A,
+  stan_data_A = stan_data_A,
+
+  # model text and file path (so Script 18 can reproduce Model A exactly)
+  stan_file_A       = stan_file_A,
+  stan_model_A_text = stan_model_A_text,
+
+  # key derived objects (useful for plotting / diagnostics without refitting)
+  prob_I_A      = prob_I_A,
+  pcr_with_prob = pcr_with_prob,
+
+  # diagnostics from block 11 (if present)
+  cadence_by_pid    = if (exists("cadence_by_pid")) cadence_by_pid else NULL,
+  positivity_by_pid = if (exists("positivity_by_pid")) positivity_by_pid else NULL,
+
+  # file paths for heavy objects saved separately
+  fit_A_path       = here::here("outputs", "fits", "fit_A.rds"),
+  log_lik_mat_path = here::here("outputs", "rds", "log_lik_mat_D.rds"),
+  loo_A_path        = here::here("outputs", "rds", "loo_A.rds"),
+  waic_A_path       = here::here("outputs", "rds", "waic_A.rds")
+)
+
+saveRDS(state_17, file = file.path(rds_dir, "model_A_state_core.rds"))
+cat("Saved core state to:", file.path(rds_dir, "model_A_state_core.rds"), "\n")
+
+# --- 12b) Save Model A fit object (for direct comparison in Script 18) ----
+if (exists("fit_A")) {
+  saveRDS(fit_A, file = file.path(fit_dir, "fit_A.rds"))
+  cat("Saved fit_A to:", file.path(fit_dir, "fit_A.rds"), "\n")
+} else {
+  cat("NOTE: fit_A not found in environment; did not save fit_A.rds\n")
+}
+
+# --- 12c) Save log-likelihood matrix used for LOO/WAIC --------------------
+# Prefer using existing log_lik_mat if you already created it in chunk 8.
+# Otherwise, build it from fit_A.
+if (exists("log_lik_mat")) {
+  log_lik_mat_D <- log_lik_mat
+} else if (exists("fit_A")) {
+  log_lik_mat_D <- fit_A$draws("log_lik_subj", format = "matrix")
+} else {
+  log_lik_mat_D <- NULL
+}
+
+if (!is.null(log_lik_mat_D)) {
+  saveRDS(log_lik_mat_D, file = file.path(rds_dir, "log_lik_mat_D.rds"))
+  cat("Saved log_lik_mat_D to:", file.path(rds_dir, "log_lik_mat_D.rds"), "\n")
+} else {
+  cat("NOTE: Could not save log_lik_mat_D (need log_lik_mat or fit_A)\n")
+}
+
+# --- 12d) Save LOO + WAIC objects (optional but convenient) ---------------
+# If already computed, save them; otherwise compute from log_lik_mat_D.
+if (!exists("loo_A") && !is.null(log_lik_mat_D)) {
+  loo_A <- loo::loo(log_lik_mat_D)
+}
+if (!exists("waic_A") && !is.null(log_lik_mat_D)) {
+  waic_A <- loo::waic(log_lik_mat_D)
+}
+
+if (exists("loo_A")) {
+  saveRDS(loo_A, file = file.path(rds_dir, "loo_A.rds"))
+  cat("Saved loo_A to:", file.path(rds_dir, "loo_A.rds"), "\n")
+} else {
+  cat("NOTE: loo_A not available; did not save loo_A.rds\n")
+}
+
+if (exists("waic_A")) {
+  saveRDS(waic_A, file = file.path(rds_dir, "waic_A.rds"))
+  cat("Saved waic_A to:", file.path(rds_dir, "waic_A.rds"), "\n")
+} else {
+  cat("NOTE: waic_A not available; did not save waic_A.rds\n")
+}
+
+```
+
+## 95% credible interbals
+
+```{r}
+# -------------------------------------------------------------------------
+# Summarise key parameters with 95% credible intervals
+# -------------------------------------------------------------------------
+
+pars_summary <- c(
+  # logits 
+  "alpha_SI", "alpha_IS", "alpha_pi",
+  "alpha_phi_I", "alpha_phi_S",
+
+  # probabilities on natural scale
+  "p_SI", "p_IS", "pi_I", "phi_I", "phi_S",
+
+  # Ct distribution parameters
+  "mu_I", "mu_S", "sigma_I", "sigma_S"
+)
+
+# Extract posterior draws
+draws_A <- fit_A$draws(
+  variables = pars_summary,
+  format = "draws_df"
+)
+
+# Summarise posterior draws using 95% credible intervals
+results_model_A_95 <- draws_A %>%
+  as_tibble() %>%
+  dplyr::select(all_of(pars_summary)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(variable) %>%
+  summarise(
+    mean   = mean(value),
+    median = median(value),
+    sd     = sd(value),
+    q2.5   = quantile(value, 0.025),
+    q97.5  = quantile(value, 0.975),
+    .groups = "drop"
+  )
+
+# Add MCMC diagnostics from CmdStan summary
+diagnostics_A <- fit_A$summary(pars_summary) %>%
+  dplyr::select(variable, rhat, ess_bulk, ess_tail)
+
+results_model_A_95 <- results_model_A_95 %>%
+  left_join(diagnostics_A, by = "variable") %>%
+  mutate(
+    variable = factor(variable, levels = pars_summary)
+  ) %>%
+  arrange(variable)
+
+results_model_A_95
+
+##
+# -------------------------------------------------------------------------
+# Derived quantities with 95% credible intervals
+# -------------------------------------------------------------------------
+
+derived_draws_A <- fit_A$draws(
+  variables = c("p_SI", "p_IS", "phi_I", "phi_S"),
+  format = "draws_df"
+) %>%
+  as_tibble() %>%
+  mutate(
+    acquisition_percent      = 100 * p_SI,
+    clearance_percent        = 100 * p_IS,
+    mean_duration_days       = 1 / p_IS,
+    detection_in_I_percent   = 100 * phi_I,
+    amplification_in_S_percent = 100 * phi_S,
+    specificity_like_percent = 100 * (1 - phi_S)
+  ) %>%
+  dplyr::select(
+    acquisition_percent,
+    clearance_percent,
+    mean_duration_days,
+    detection_in_I_percent,
+    amplification_in_S_percent,
+    specificity_like_percent
+  )
+
+derived_results_A_95 <- derived_draws_A %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "quantity",
+    values_to = "value"
+  ) %>%
+  group_by(quantity) %>%
+  summarise(
+    mean   = mean(value),
+    median = median(value),
+    sd     = sd(value),
+    q2.5   = quantile(value, 0.025),
+    q97.5  = quantile(value, 0.975),
+    .groups = "drop"
+  )
+
+derived_results_A_95
+```
