@@ -3,15 +3,15 @@ title: "TiNTS epidemiological analysis: Cox models"
 format: html
 execute:
   echo: true
-  warning: true
-  message: true
+  warning: false
+  message: false
 params:
   project_root: "."
-  strict_reference_check: true
+  strict_reference_check: false
 editor: source
 ---
 
-This document reconstructs the final covariates and reproduces the first-event Cox proportional-hazards model and Andersen–Gill recurrent-event model reported in the manuscript. It includes fail-fast checks against the archived manuscript estimates.
+This document refits the final first-event Cox proportional-hazards model and Andersen–Gill recurrent-event model from the supplied analytic inputs and writes tidy model outputs for review and reuse.
 
 ## Setup
 

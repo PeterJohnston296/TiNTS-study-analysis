@@ -3,8 +3,8 @@ title: "TiNTS epidemiological analysis: Ct-threshold sensitivity"
 format: html
 execute:
   echo: true
-  warning: true
-  message: true
+  warning: false
+  message: false
 editor: source
 ---
 

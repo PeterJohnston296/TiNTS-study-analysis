@@ -3,8 +3,8 @@ title: "TiNTS epidemiological analysis: variable preparation"
 format: html
 execute:
   echo: true
-  warning: true
-  message: true
+  warning: false
+  message: false
 editor: source
 ---
 
@@ -38,8 +38,11 @@ A <- A_raw %>% dplyr::select (
 A <- A |> 
   rename(toilet_type = hh_type)
 
-# A one-off source-data recoding required by the original analysis is applied
-# before pseudonymisation by the private data-export workflow.
+# However, HH10474 had public toilet under other, need to assign this correctly
+A <- A %>%
+  mutate(
+    toilet_type = if_else(hhid == "HH10474", "Public toilet", toilet_type)
+  )
 
 A <- A %>%
   dplyr::mutate(

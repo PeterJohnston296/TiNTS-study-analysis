@@ -3,8 +3,8 @@ title: "TiNTS epidemiological analysis: elastic-net variable selection"
 format: html
 execute:
   echo: true
-  warning: true
-  message: true
+  warning: false
+  message: false
 editor: source
 ---
 
