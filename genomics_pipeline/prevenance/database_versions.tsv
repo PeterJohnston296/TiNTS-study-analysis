@@ -1,0 +1,5 @@
+database	version	path	manifest_sha256
+CheckM	2015-01-16	~/TiNTS_genomics/databases/checkm/checkm_data_2015_01_16	fbbd968d29d72a2c6dcdf99cb11af7582db13623e2a656cc5650d560b57afc8f
+AMRFinderPlus	2026-08-07.1	~/miniforge3/envs/tints-amrfinder/share/amrfinderplus/data/2026-08-07.1	c04b0472cc331d09afebc48276575da79372d94f150f04940f3e83d59e79d09f
+T2T-CHM13v2.0	GCF_009914755.1	~/TiNTS_genomics/databases/human	728fff9d99586918d1015cceec912fa828a43b9ee6aeddfb20372f5e157cb9c9
+Kraken2 Standard-16	2026-02-26	~/TiNTS_genomics/databases/kraken2_standard16_20260226	953f4b9d7e6a203493014d6a0081b2aa49d5d70305713a5c6bb3ee818679c2ac

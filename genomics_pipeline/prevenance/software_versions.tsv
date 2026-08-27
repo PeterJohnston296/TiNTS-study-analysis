@@ -1,0 +1,23 @@
+tool	version_or_identifier
+fastp	1.3.6
+Bowtie2	2.5.5
+SAMtools	1.24
+HTSlib	1.24
+Kraken2	2.17.1
+Rasusa	5.1.0
+SPAdes	4.3.0
+QUAST	5.3.0
+CheckM	1.2.5
+SISTR	1.1.3
+mlst	2.35.0
+NCBI BLAST+	2.17.0+
+AMRFinderPlus	4.2.7
+MAFFT	7.526
+SNP-sites	2.5.1
+Gubbins	3.4.3
+IQ-TREE	3.1.3
+Prokka	1.15.6
+Panaroo	1.8.0
+Snippy	4.6.0
+Biopython	1.88
+KrakenTools	3199bea2b4768b2bb435f04483f5af3d8e51d4ae
