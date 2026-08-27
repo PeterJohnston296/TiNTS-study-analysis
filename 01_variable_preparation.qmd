@@ -1,0 +1,1018 @@
+---
+title: "TiNTS epidemiological analysis: variable preparation"
+format: html
+execute:
+  echo: true
+  warning: true
+  message: true
+editor: source
+---
+
+This document reproduces preparation of household- and participant-level covariates used in the TiNTS epidemiological association analyses. It expects the project directory structure used for the final analysis, including `data_raw/`, `data_clean/`, and `rds/`.
+
+```{r}
+library(tidyverse)
+library(here)
+library(survival)
+library(glmnet)
+library(purrr)
+library(stringr)
+library(forcats)
+
+conflicted::conflict_prefer("select", "dplyr")
+conflicted::conflict_prefer("filter", "dplyr")
+conflicted::conflict_prefer("lag",    "dplyr")
+
+A_raw        <- read_csv(here("data_raw", "CRF_A.csv"))
+B_raw        <- read_csv(here("data_raw", "CRF_B_MCA.csv"))
+river        <- read_csv(here("data_raw", "household_distance_from_river.csv"))
+hh_wealth    <- read_csv(here("data_clean", "wealth_index_by_household.csv"))
+
+A <- A_raw %>% dplyr::select (
+  "hhid","hh_type","hh_sourceofwater","hh_watertreated",
+  "before_eatn","before_prepfood","after_toilet","lookn_dirty",
+  "hh_rainwater","hh_flood","eat_straight","peel_skin","normally_eat",
+  "keep_animals","hh_riverwater","hh_visitors","perishable_food","hh_floor","hh_washing", "hh_bathing"
+)
+
+A <- A |> 
+  rename(toilet_type = hh_type)
+
+# A one-off source-data recoding required by the original analysis is applied
+# before pseudonymisation by the private data-export workflow.
+
+A <- A %>%
+  dplyr::mutate(
+    # first classify as strings (unchanged)
+    toilet_type_binary = dplyr::case_when(
+      toilet_type %in% c("Home: flush or pour toilet to septic tank",
+                         "Home: pit latrine with slab and cover",
+                         "Home: pit latrine with slab only") ~ "Improved private",
+      toilet_type %in% c("Home: pit latrine with soil/wood floor",
+                         "Public toilet") ~ "Unimproved/shared",
+      TRUE ~ NA_character_
+    ),
+    # now convert to numeric 0/1 (0 = Improved private, 1 = Unimproved/shared)
+    toilet_type_binary = dplyr::case_when(
+      toilet_type_binary == "Improved private"  ~ 0L,
+      toilet_type_binary == "Unimproved/shared" ~ 1L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+# now remove the unneeded column
+A <- dplyr::select(A, -toilet_type)
+
+
+# 1) Clean and standardise labels; set reference
+A <- A %>%
+  mutate(
+    hh_sourceofwater = str_squish(trimws(hh_sourceofwater)),
+    water_source = case_when(
+      hh_sourceofwater %in% c("Public tap/Standpipe")            ~ "Public tap/Standpipe",
+      hh_sourceofwater %in% c("Piped into dwelling")             ~ "Piped into dwelling",
+      hh_sourceofwater %in% c("Piped outside dwelling")          ~ "Piped outside dwelling",
+      hh_sourceofwater %in% c("Tube well / borehole",
+                              "Tube well/borehole",
+                              "Borehole")                        ~ "Tube well / borehole",
+      hh_sourceofwater %in% c("Unprotected well / spring",
+                              "Unprotected well/spring")         ~ "Unprotected well / spring",
+      TRUE ~ NA_character_
+    ),
+    water_source = fct_relevel(
+      factor(water_source),
+      "Public tap/Standpipe",  # reference (largest n)
+      "Piped outside dwelling",
+      "Piped into dwelling",
+      "Tube well / borehole",
+      "Unprotected well / spring"
+    )
+  )
+
+
+# 2) Create K-1 dummy columns (vs reference = Public tap/Standpipe)
+A <- A %>%
+  mutate(
+    water_piped_inside   = if_else(water_source == "Piped into dwelling", 1L,
+                              if_else(is.na(water_source), NA_integer_, 0L)),
+    water_piped_outside  = if_else(water_source == "Piped outside dwelling", 1L,
+                              if_else(is.na(water_source), NA_integer_, 0L)),
+    water_borehole       = if_else(water_source == "Tube well / borehole", 1L,
+                              if_else(is.na(water_source), NA_integer_, 0L)),
+    water_unprotected    = if_else(water_source == "Unprotected well / spring", 1L,
+                              if_else(is.na(water_source), NA_integer_, 0L))
+  )
+
+# 3) Group map vector for the grouped selection parent "water_source"
+water_source_group <- c("water_piped_inside",
+                        "water_piped_outside",
+                        "water_borehole",
+                        "water_unprotected")
+# Drop the original from the modelling dataset to prevent auto-dummying
+A <- A %>% dplyr::select(-hh_sourceofwater)
+
+
+
+# 1) Clean the raw column (trim/squish), keep a raw copy for QC if helpful
+A <- A %>%
+  dplyr::mutate(
+    hh_watertreated = str_squish(trimws(hh_watertreated)))
+
+# 2) Recode to binary: 1 = Yes (treated), 0 = No (not treated), NA preserved
+
+A <- A %>%
+  dplyr::mutate(
+    water_treated = case_when(
+      hh_watertreated %in% c("Yes", "YES", "yes") ~ 1L,
+      hh_watertreated %in% c("No",  "NO",  "no")  ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+
+
+# 3) Drop the original from the modelling dataset to prevent auto-dummying
+A <- A %>% dplyr::select(-hh_watertreated)
+
+
+# 1) Code items to 0/1 (Yes=1, No=0)
+A <- A %>%
+  dplyr::mutate(
+    before_eatn     = ifelse(before_eatn     == "Yes", 1L, 0L),
+    before_prepfood = ifelse(before_prepfood == "Yes", 1L, 0L),
+    after_toilet    = ifelse(after_toilet    == "Yes", 1L, 0L),
+    lookn_dirty     = ifelse(lookn_dirty     == "Yes", 1L, 0L)
+  )
+
+# 2) Composite Handwashing Index (0–1) and z-score for modelling
+A <- A %>%
+  dplyr::mutate(
+    hand_index   = (before_eatn + before_prepfood + after_toilet + lookn_dirty) / 4,
+    hand_index_z = (hand_index - mean(hand_index)) / sd(hand_index)
+  )
+
+# remove the obsolete columns
+A <- A %>%
+  dplyr::select(-before_eatn, -before_prepfood, -after_toilet, -lookn_dirty)
+
+
+
+# Clean and recode: 1 = Yes (standing rainwater present), 0 = No
+A <- A %>%
+  dplyr::mutate(
+    hh_rainwater = str_squish(trimws(hh_rainwater)),
+    standing_rainwater = case_when(
+      hh_rainwater %in% c("Yes","yes","YES") ~ 1L,
+      hh_rainwater %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  # Drop the raw column from the modelling dataset to prevent auto-dummying
+  dplyr::select(-hh_rainwater)
+
+
+
+A <- A %>%
+  dplyr::mutate(
+    hh_flood = str_squish(trimws(hh_flood)),
+    flood_last_year = case_when(
+      hh_flood %in% c("Yes","yes","YES") ~ 1L,
+      hh_flood %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(-hh_flood)  # drop raw column from modelling dataset
+
+
+
+# 1) Clean raw fields
+A <- A %>%
+  dplyr::mutate(
+    eat_straight = str_squish(trimws(eat_straight)),
+    peel_skin    = str_squish(trimws(peel_skin))
+  )
+
+# 2) Recode to safety-oriented binaries (1 = safer; 0 = riskier)
+A <- A %>%
+  dplyr::mutate(
+    # Safer if NOT eaten straight from market
+    safe_not_straight = case_when(
+      eat_straight %in% c("No","no","NO")    ~ 1L,
+      eat_straight %in% c("Yes","yes","YES") ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    # Safer if peel skin
+    peel_skin_yes = case_when(
+      peel_skin %in% c("Yes","yes","YES") ~ 1L,
+      peel_skin %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+# 3) Composite Veg Handling Index (0–1) and z-score
+A <- A %>%
+  dplyr::mutate(
+    veg_handling_index   = (safe_not_straight + peel_skin_yes) / 2,
+    veg_handling_index_z = (veg_handling_index - mean(veg_handling_index, na.rm = TRUE)) /
+                           sd(veg_handling_index,  na.rm = TRUE)
+  )
+
+# 4) Drop raw text columns from the modelling dataset to prevent auto-dummying
+
+A <- A %>% dplyr::select(-eat_straight, -peel_skin)
+
+
+
+A <- A %>%
+  dplyr::mutate(
+    normally_eat = str_squish(trimws(normally_eat)),
+    shared_plates = case_when(
+      normally_eat == "Shared plates"   ~ 1L,
+      normally_eat == "Separate plates" ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(-normally_eat)  # drop raw factor to prevent auto-dummying
+
+
+
+A <- A %>%
+  mutate(
+    keep_animals = str_squish(trimws(keep_animals)),
+    keep_animals = case_when(
+      keep_animals %in% c("Yes","yes","YES") ~ 1L,
+      keep_animals %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+
+A <- A %>%
+  dplyr::mutate(
+    hh_riverwater = str_squish(trimws(hh_riverwater)),
+    river_water_contact = case_when(
+      hh_riverwater %in% c("Yes","yes","YES") ~ 1L,
+      hh_riverwater %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(-hh_riverwater)  # drop raw column to prevent auto-dummying
+
+
+
+A <- A %>%
+  dplyr::mutate(
+    hh_visitors = str_squish(trimws(hh_visitors)),
+    hh_visitors = case_when(
+      hh_visitors %in% c("Yes","yes","YES") ~ 1L,
+      hh_visitors %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+
+A <- A %>%
+  dplyr::mutate(
+    perishable_food = str_squish(trimws(perishable_food)),
+    perishable_food = case_when(
+      perishable_food %in% c("Container")            ~ "Container",
+      perishable_food %in% c("Dark cupboard")        ~ "Dark cupboard",
+      perishable_food %in% c("Eaten same day")       ~ "Eaten same day",
+      perishable_food %in% c("Food is left on surfaces") ~ "Left on surfaces",
+      perishable_food %in% c("Refrigerator")         ~ "Refrigerator",
+      TRUE ~ NA_character_
+    ),
+    # factor with reference = "Eaten same day"
+    perishable_food = fct_relevel(
+      factor(perishable_food),
+      "Eaten same day", "Container", "Refrigerator", "Dark cupboard", "Left on surfaces"
+    )
+  )
+
+# Create dummies vs reference
+A <- A %>%
+  dplyr::mutate(
+    food_container   = if_else(perishable_food == "Container", 1L,
+                          if_else(is.na(perishable_food), NA_integer_, 0L)),
+    food_refrigerator = if_else(perishable_food == "Refrigerator", 1L,
+                          if_else(is.na(perishable_food), NA_integer_, 0L)),
+    food_cupboard    = if_else(perishable_food == "Dark cupboard", 1L,
+                          if_else(is.na(perishable_food), NA_integer_, 0L)),
+    food_surfaces    = if_else(perishable_food == "Left on surfaces", 1L,
+                          if_else(is.na(perishable_food), NA_integer_, 0L))
+  )
+
+# Define the group for selection
+perishable_food_group <- c("food_container", "food_refrigerator",
+                           "food_cupboard", "food_surfaces")
+
+# remove obsolete column
+A <- A %>%
+  dplyr::select(-perishable_food)
+
+
+A <- A %>%
+  dplyr::mutate(
+    hh_floor = str_squish(trimws(hh_floor)),
+    floor_cat = case_when(
+      hh_floor %in% c("Cement", "Tile") ~ "Hard floor",
+      hh_floor %in% c("Sand/soil")      ~ "Sand/soil",
+      TRUE ~ NA_character_
+    ),
+    floor_cat = fct_relevel(factor(floor_cat), "Sand/soil", "Hard floor"),
+    # 1 = Hard floor, 0 = Sand/soil
+    hard_floor = case_when(
+      floor_cat == "Hard floor" ~ 1L,
+      floor_cat == "Sand/soil"  ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  # Drop the original raw column to avoid accidental auto-dummying
+  dplyr::select(-hh_floor)
+
+
+
+# 1) Rename and clean
+A <- A %>%
+  rename(utensil_washing = hh_washing) %>%
+  dplyr::mutate(
+    utensil_washing = str_squish(trimws(utensil_washing)),
+    # Make factor with Public tap/Standpipe as the reference
+    utensil_washing = fct_relevel(
+      factor(utensil_washing),
+      "Public tap/Standpipe"
+    )
+  )
+
+# 2) Create K-1 explicit dummy columns (vs reference = Public tap/Standpipe)
+A <- A %>%
+  dplyr::mutate(
+    utensil_piped_inside   = if_else(utensil_washing == "Piped into dwelling",        1L,
+                                 if_else(is.na(utensil_washing), NA_integer_, 0L)),
+    utensil_piped_outside  = if_else(utensil_washing == "Piped outside dwelling",     1L,
+                                 if_else(is.na(utensil_washing), NA_integer_, 0L)),
+    utensil_river          = if_else(utensil_washing == "River water",                1L,
+                                 if_else(is.na(utensil_washing), NA_integer_, 0L)),
+    utensil_borehole       = if_else(utensil_washing == "Tube well / borehole",       1L,
+                                 if_else(is.na(utensil_washing), NA_integer_, 0L)),
+    utensil_unprotected    = if_else(utensil_washing == "Unprotected well / spring",  1L,
+                                 if_else(is.na(utensil_washing), NA_integer_, 0L))
+  )
+
+
+
+# 3) Group vector for grouped selection
+utensil_washing_group <- c("utensil_piped_inside",
+                           "utensil_piped_outside",
+                           "utensil_river",
+                           "utensil_borehole",
+                           "utensil_unprotected")
+
+
+A <- A %>%
+  dplyr::mutate(
+    hh_bathing = str_squish(trimws(hh_bathing)),
+    hh_bathing = fct_relevel(factor(hh_bathing), "Public tap/Standpipe"),
+    bathe_bottled     = if_else(hh_bathing == "Bottled", 1L,
+                           if_else(is.na(hh_bathing), NA_integer_, 0L)),
+    bathe_piped_inside= if_else(hh_bathing == "Piped into dwelling", 1L,
+                           if_else(is.na(hh_bathing), NA_integer_, 0L)),
+    bathe_piped_outside= if_else(hh_bathing == "Piped outside dwelling", 1L,
+                           if_else(is.na(hh_bathing), NA_integer_, 0L)),
+    bathe_borehole    = if_else(hh_bathing == "Tube well / borehole", 1L,
+                           if_else(is.na(hh_bathing), NA_integer_, 0L)),
+    bathe_unprotected = if_else(hh_bathing == "Unprotected well / spring", 1L,
+                           if_else(is.na(hh_bathing), NA_integer_, 0L))
+  )
+
+# Group for grouped selection
+bathe_location_group <- c("bathe_bottled",
+                          "bathe_piped_inside",
+                          "bathe_piped_outside",
+                          "bathe_borehole",
+                          "bathe_unprotected")
+
+
+# 1) Prepare river distances; if duplicates per hhid, keep the minimum
+river_dist <- river %>%
+  dplyr::select(hhid, distance) %>%
+  group_by(hhid) %>%
+  summarise(river_distance = min(distance, na.rm = TRUE), .groups = "drop")
+
+# 2) Merge into A and create z-score
+A <- A %>%
+  left_join(river_dist, by = "hhid") %>%
+  dplyr::mutate(
+    river_distance_z = (river_distance - mean(river_distance, na.rm = TRUE)) /
+                       sd(river_distance,  na.rm = TRUE)
+  )
+
+#  quick checks:
+summary(A$river_distance)
+summary(A$river_distance_z)
+
+B <- B_raw %>%
+  dplyr::select(
+    pid, hhid, age_yr, sex, dys_leav_day, dys_leav_evn, use_public_tpt, cls_contactnum,
+    sleep_next, attend_worship, goto_market, attend_bar, eat_atcafe,
+    eat_meat, eat_meatfreq, eat_fish, eat_fishfreq, smoke, drink_alcohol,
+    hiv_status, cotrim, take_medication, take_antib, antib4wks,
+    hrs_spentnhouse, leav_ndirnd, visit_friend, attend_school, readnwrite
+  )
+
+# Rename and z-score
+
+B <- B %>%
+  rename(days_out_day = dys_leav_day) %>%
+  dplyr::mutate(
+    days_out_day   = as.integer(days_out_day),
+    days_out_day_z = (days_out_day - mean(days_out_day, na.rm = TRUE)) /
+                     sd(days_out_day,  na.rm = TRUE)
+  )
+
+
+
+B <- B %>%
+  rename(days_out_eve = dys_leav_evn) %>%
+  dplyr::mutate(
+    days_out_eve   = as.integer(days_out_eve),
+    days_out_eve_z = (days_out_eve - mean(days_out_eve, na.rm = TRUE)) /
+                     sd(days_out_eve,  na.rm = TRUE)
+  )
+
+
+# Clean and set factor with "Never" as reference (for interpretability)
+B <- B %>%
+  dplyr::mutate(
+    use_public_tpt = str_squish(trimws(use_public_tpt)),
+    public_tpt_factor = fct_relevel(
+      factor(use_public_tpt),
+      "Never",                       # reference
+      "At least once a year",
+      "At least once a month",
+      "At least once a week",
+      "Every day"
+    )
+  )
+
+# Create K-1 explicit dummies (vs "Never")
+B <- B %>%
+  dplyr::mutate(
+    tpt_year  = if_else(public_tpt_factor == "At least once a year",  1L,
+                   if_else(is.na(public_tpt_factor), NA_integer_, 0L)),
+    tpt_month = if_else(public_tpt_factor == "At least once a month", 1L,
+                   if_else(is.na(public_tpt_factor), NA_integer_, 0L)),
+    tpt_week  = if_else(public_tpt_factor == "At least once a week",  1L,
+                   if_else(is.na(public_tpt_factor), NA_integer_, 0L)),
+    tpt_daily = if_else(public_tpt_factor == "Every day",             1L,
+                   if_else(is.na(public_tpt_factor), NA_integer_, 0L))
+  )
+
+
+# For grouped selection: treat these as one parent group
+public_tpt_group <- c("tpt_year","tpt_month","tpt_week","tpt_daily")
+
+B <- B %>%
+  mutate(
+    cls_contactnum = as.integer(cls_contactnum),
+    cls_contactnum_z = (cls_contactnum - mean(cls_contactnum, na.rm = TRUE)) /
+                       sd(cls_contactnum,  na.rm = TRUE)
+  )
+
+
+B <- B %>%
+  dplyr::mutate(
+    sleep_next   = as.integer(sleep_next),
+    sleep_next_z = (sleep_next - mean(sleep_next, na.rm = TRUE)) /
+                   sd(sleep_next,  na.rm = TRUE)
+  )
+
+
+B <- B %>%
+  dplyr::mutate(
+    attend_worship = str_squish(trimws(attend_worship)),
+    attend_worship = case_when(
+      attend_worship %in% c("Yes","yes","YES") ~ 1L,
+      attend_worship %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+B <- B %>%
+  dplyr::mutate(
+    goto_market = as.integer(goto_market)
+  )
+
+
+
+B <- B %>%
+  dplyr::mutate(
+    is_adult = if_else(age_yr >= 18, 1L, 0L),
+    attend_bar = case_when(
+      is_adult == 1L & attend_bar %in% c("Yes","yes","YES") ~ 1L,
+      is_adult == 1L & attend_bar %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ 0L   # <- important: code NA (ineligible kids) as 0 here
+    )
+  )
+
+
+#
+
+
+B <- B %>%
+  dplyr::mutate(
+    eat_atcafe = str_squish(trimws(eat_atcafe)),
+    eat_atcafe = case_when(
+      eat_atcafe %in% c("Yes","yes","YES") ~ 1L,
+      eat_atcafe %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+
+
+# 1) Clean inputs
+B <- B %>%
+  dplyr::mutate(
+    eat_meat      = str_squish(trimws(eat_meat)),
+    eat_meatfreq  = str_squish(trimws(eat_meatfreq))
+  )
+
+# 2) Combine into one frequency factor:
+#    - If eat_meat == "No" → "Never"
+#    - Else use reported eat_meatfreq as-is
+B <- B %>%
+  dplyr::mutate(
+    meat_freq = case_when(
+      eat_meat == "No" ~ "Never",
+      TRUE             ~ eat_meatfreq
+    ),
+    # Standardise spelling/order and set a stable reference (largest cell ~ "At least once a week")
+    meat_freq = fct_relevel(
+      factor(meat_freq),
+      "At least once a week",  # reference
+      "At least once a month",
+      "At least once a year",
+      "Every day",
+      "Never"
+    )
+  )
+
+# 3) Create K-1 explicit dummies vs reference = "At least once a week"
+B <- B %>%
+  dplyr::mutate(
+    meat_month = if_else(meat_freq == "At least once a month", 1L,
+                    if_else(is.na(meat_freq), NA_integer_, 0L)),
+    meat_year  = if_else(meat_freq == "At least once a year",  1L,
+                    if_else(is.na(meat_freq), NA_integer_, 0L)),
+    meat_daily = if_else(meat_freq == "Every day",             1L,
+                    if_else(is.na(meat_freq), NA_integer_, 0L)),
+    meat_never = if_else(meat_freq == "Never",                 1L,
+                    if_else(is.na(meat_freq), NA_integer_, 0L))
+  )
+
+# 4) Group vector for selection (treat as one parent in the grouped selection)
+meat_freq_group <- c("meat_month","meat_year","meat_daily","meat_never")
+
+# Keep the tidy factor for descriptives; model only uses the dummies
+B <- B %>%
+  dplyr::select(-eat_meat, -eat_meatfreq)
+
+
+
+# Clean inputs
+B <- B %>%
+  dplyr::mutate(
+    eat_fish     = str_squish(trimws(eat_fish)),
+    eat_fishfreq = str_squish(trimws(eat_fishfreq))
+  )
+
+# Combine into one frequency factor
+B <- B %>%
+  dplyr::mutate(
+    fish_freq = case_when(
+      eat_fish == "No" ~ "Never",
+      TRUE             ~ eat_fishfreq
+    ),
+    fish_freq = fct_relevel(
+      factor(fish_freq),
+      "At least once a week",   # reference (largest n)
+      "At least once a month",
+      "Every day",
+      "Never"
+    )
+  )
+
+# Create K-1 explicit dummies vs reference = "At least once a week"
+B <- B %>%
+  dplyr::mutate(
+    fish_month = if_else(fish_freq == "At least once a month", 1L,
+                    if_else(is.na(fish_freq), NA_integer_, 0L)),
+    fish_daily = if_else(fish_freq == "Every day",             1L,
+                    if_else(is.na(fish_freq), NA_integer_, 0L)),
+    fish_never = if_else(fish_freq == "Never",                 1L,
+                    if_else(is.na(fish_freq), NA_integer_, 0L))
+  )
+
+# Group vector for selection (treat as one parent in the grouped selection)
+fish_freq_group <- c("fish_month","fish_daily","fish_never")
+
+# Remove source columns not used in the modelling frame
+B <- B %>%
+  dplyr::select(-eat_fish, -eat_fishfreq)
+# (Keep 'fish_freq' for descriptives; don't include it in the model matrix.)
+
+
+
+# Clean raw smoking variable for descriptives; preserve NA below age 18
+B <- B %>%
+ dplyr:: mutate(
+    smoke = case_when(
+      str_to_lower(str_squish(smoke)) %in% c("yes") ~ "Yes",
+      str_to_lower(str_squish(smoke)) %in% c("no")  ~ "No",
+      TRUE ~ smoke  # leave existing NA for children as-is
+    )
+  )
+
+# create model-ready masked variable: 1/0 for adults, 0 for ineligible children
+B <- B %>%
+  dplyr::mutate(
+    smoke_adult = case_when(
+      is_adult == 1L & smoke == "Yes" ~ 1L,
+      is_adult == 1L & smoke == "No"  ~ 0L,
+      is_adult == 0L                  ~ 0L,          # ineligible children coded 0 by design
+      TRUE                            ~ NA_integer_  # only adults with missing response become NA
+    )
+  )
+
+
+
+# tidy the raw field for descriptives (preserve existing NA for children if present)
+B <- B %>%
+  dplyr::mutate(
+    drink_alcohol = case_when(
+      str_to_lower(str_squish(drink_alcohol)) %in% "yes" ~ "Yes",
+      str_to_lower(str_squish(drink_alcohol)) %in% "no"  ~ "No",
+      TRUE ~ drink_alcohol
+    )
+  )
+
+# model-ready masked variable: adults coded 1/0; children coded 0 (ineligible)
+B <- B %>%
+  dplyr::mutate(
+    drink_alcohol_adult = case_when(
+      is_adult == 1L & drink_alcohol == "Yes" ~ 1L,
+      is_adult == 1L & drink_alcohol == "No"  ~ 0L,
+      is_adult == 0L                          ~ 0L,          # ineligible (children)
+      TRUE                                    ~ NA_integer_  # only adults with missing response become NA
+    )
+  )
+
+
+# 1) Clean HIV status to three levels and keep a tidy factor for descriptives
+B <- B %>%
+  dplyr::mutate(
+    hiv_status = str_squish(trimws(hiv_status)),
+    hiv_status = case_when(
+      str_to_lower(hiv_status) %in% c("reactive","positive","hiv positive","pos") ~ "Reactive",
+      str_to_lower(hiv_status) %in% c("non-reactive","negative","hiv negative","neg") ~ "Non-reactive",
+      TRUE ~ "Unknown"
+    ),
+    hiv_status_factor = fct_relevel(factor(hiv_status), "Unknown","Non-reactive","Reactive")
+  )
+
+# 2) Model terms (missingness-aware)
+B <- B %>%
+  dplyr::mutate(
+    hiv_reactive = if_else(hiv_status_factor == "Reactive", 1L, 0L),
+    hiv_unknown  = if_else(hiv_status_factor == "Unknown",  1L, 0L)
+  )
+
+# 3) Cotrimoxazole for HIV+ only (kept for sensitivity analysis; not in primary model)
+B <- B %>%
+  dplyr::mutate(
+    cotrim   = str_squish(trimws(cotrim)),
+    cotrim_hivpos = case_when(
+      hiv_status_factor == "Reactive" & cotrim == "Yes" ~ 1L,
+      hiv_status_factor == "Reactive" & cotrim == "No"  ~ 0L,
+      hiv_status_factor != "Reactive"                   ~ 0L,      # ineligible coded 0; interpret with HIV flag if used
+      TRUE                                              ~ NA_integer_
+    )
+  )
+
+# 4) Remove redundant source columns from the modelling frame
+#    - keep hiv_status_factor for descriptives
+#    - drop raw 'hiv_status' (string) and raw 'cotrim'
+B <- B %>%
+  dplyr::select(-hiv_status, -cotrim)
+
+
+
+# Clean raw fields
+B <- B %>%
+  dplyr::mutate(
+    take_medication = str_squish(trimws(take_medication)),
+    take_antib      = str_squish(trimws(take_antib)),
+    antib4wks       = str_squish(trimws(antib4wks))
+  )
+
+# Composite antibiotic exposure for sensitivity analysis
+B <- B %>%
+  dplyr::mutate(
+    take_antib_bin = case_when(
+      take_antib %in% c("Yes","yes","YES") ~ 1L,
+      take_antib %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    antib4wks_bin = case_when(
+      antib4wks %in% c("Yes","yes","YES") ~ 1L,
+      antib4wks %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    # Composite: any recent/ongoing antibiotic exposure
+    abx_recent_any = case_when(
+      antib4wks_bin == 1L | take_antib_bin == 1L ~ 1L,
+      antib4wks_bin == 0L & take_antib_bin == 0L ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+
+
+#  Remove raw source columns from the modelling frame to keep it tidy;
+
+B <- B %>%
+  dplyr::select(-take_medication, -take_antib, -antib4wks)
+
+
+
+B <- B %>%
+  rename(hours_in_house = hrs_spentnhouse) %>%
+  mutate(
+    hours_in_house = factor(
+      str_squish(trimws(hours_in_house)),
+      levels = c("Less than 5 hours", "5-8 hours", "9-13 hours", "14-19 hours", "More than 20 hours"),
+      ordered = TRUE
+    ),
+    hours_in_house_ord = as.integer(hours_in_house) - 1L,              # 0..4
+    hours_in_house_z   = as.numeric(scale(hours_in_house_ord))
+  )
+
+
+
+# Clean and set factor with "Never" as reference
+B <- B %>%
+  dplyr::mutate(
+    leav_ndirnd = str_squish(trimws(leav_ndirnd)),
+    leave_ndirande = fct_relevel(
+      factor(leav_ndirnd),
+      "Never",                       # reference for modelling
+      "At least once a year",
+      "At least once a month",
+      "At least once a week",
+      "Every day"
+    )
+  )
+
+# Create K-1 dummies vs "Never"
+B <- B %>%
+  dplyr::mutate(
+    ndir_year  = if_else(leave_ndirande == "At least once a year",  1L,
+                    if_else(is.na(leave_ndirande), NA_integer_, 0L)),
+    ndir_month = if_else(leave_ndirande == "At least once a month", 1L,
+                    if_else(is.na(leave_ndirande), NA_integer_, 0L)),
+    ndir_week  = if_else(leave_ndirande == "At least once a week",  1L,
+                    if_else(is.na(leave_ndirande), NA_integer_, 0L)),
+    ndir_daily = if_else(leave_ndirande == "Every day",             1L,
+                    if_else(is.na(leave_ndirande), NA_integer_, 0L))
+  )
+
+# Group vector for the grouped selection (treat as one parent)
+leave_ndirande_group <- c("ndir_year","ndir_month","ndir_week","ndir_daily")
+
+
+
+B <- B %>%
+  dplyr::mutate(
+    visit_friend = str_squish(trimws(visit_friend)),
+    visit_friend = case_when(
+      visit_friend %in% c("Yes","yes","YES") ~ 1L,
+      visit_friend %in% c("No","no","NO")    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+
+
+# mcreate is_child
+B <- B %>%
+  dplyr::mutate(is_child = if_else(age_yr < 18, 1L, 0L))
+
+# clean original attend_school for descriptives
+B <- B %>%
+ dplyr::mutate(
+    attend_school = str_squish(trimws(attend_school)),
+    attend_school = case_when(
+      attend_school %in% c("Yes","yes","YES") ~ "Yes",
+      attend_school %in% c("No","no","NO")    ~ "No",
+      TRUE ~ attend_school
+    )
+  )
+
+# model-ready masked variable: 1/0 for children, 0 for ineligible adults
+B <- B %>%
+  dplyr::mutate(
+    attend_school_child = case_when(
+      is_child == 1L & attend_school == "Yes" ~ 1L,
+      is_child == 1L & attend_school == "No"  ~ 0L,
+      is_child == 0L                          ~ 0L,  # ineligible adults
+      TRUE                                    ~ NA_integer_ # only if missing in children
+    )
+  )
+
+
+
+selection_df <- B %>%
+  dplyr::select(
+    pid, hhid,
+    # adjusters & flags
+    is_adult, is_child,
+    # mobility / mixing (z-scores)
+    days_out_day_z, days_out_eve_z, cls_contactnum_z, sleep_next_z, hours_in_house_z,
+    # binaries
+    attend_worship, goto_market, eat_atcafe,
+    # adult-only masked behaviours
+    attend_bar, smoke_adult, drink_alcohol_adult,
+    # child-only masked behaviour
+    attend_school_child,
+    # public transport dummies
+    tpt_year, tpt_month, tpt_week, tpt_daily,
+    # leaving Ndirande dummies
+    ndir_year, ndir_month, ndir_week, ndir_daily,
+    # meat/fish frequency dummies
+    meat_month, meat_year, meat_daily, meat_never,
+    fish_month, fish_daily, fish_never,
+    # HIV missingness-aware
+    hiv_reactive, hiv_unknown
+  ) %>%
+  left_join(
+    A %>% dplyr::select(
+      hhid,
+      # water source dummies
+      water_piped_inside, water_piped_outside, water_borehole, water_unprotected,
+      # sanitation / hygiene / behaviours
+      toilet_type_binary, water_treated, hand_index_z, veg_handling_index_z,
+      standing_rainwater, flood_last_year, shared_plates, river_water_contact,
+      hard_floor, keep_animals, hh_visitors, river_distance_z,
+      # utensil washing dummies
+      utensil_piped_inside, utensil_piped_outside, utensil_river,
+      utensil_borehole, utensil_unprotected,
+      # bathing dummies
+      bathe_bottled, bathe_piped_inside, bathe_piped_outside,
+      bathe_borehole, bathe_unprotected,
+      # perishable food dummies
+      food_container, food_refrigerator, food_cupboard, food_surfaces
+    ),
+    by = "hhid"
+  )
+
+episodes_df <- readr::read_rds(here("rds/episodes_df.rds"))
+followup_df <- readr::read_rds(here("rds/followup_df.rds"))
+
+
+
+# First-episode events with BOTH bounds present
+events_first <- episodes_df %>%
+  filter(episode_order == 1, !is.na(onset_lower), !is.na(onset_upper)) %>%
+  transmute(pid, hhid, tstart = onset_lower, tstop = onset_upper, event = 1L)
+
+# Censor rows for everyone else (no usable first-episode interval)
+censors <- followup_df %>%
+  anti_join(events_first %>% distinct(pid), by = "pid") %>%
+  transmute(pid, hhid, tstart = first_obs, tstop = last_obs, event = 0L)
+
+selection_df <- bind_rows(events_first, censors) %>%
+  left_join(selection_df, by = c("pid","hhid"))
+
+
+# ensure dates, set study start, then create numeric days
+selection_df <- selection_df %>%
+  dplyr::mutate(
+    tstart = as.Date(tstart),
+    tstop  = as.Date(tstop)
+  )
+
+study_start <- min(selection_df$tstart, na.rm = TRUE)
+
+selection_df <- selection_df %>%
+  dplyr::mutate(
+    tstart_num = as.numeric(difftime(tstart, study_start, units = "days")),
+    tstop_num  = as.numeric(difftime(tstop,  study_start, units = "days"))
+  )
+
+# How long is each person’s interval?
+selection_df <- selection_df %>%
+  dplyr::mutate(interval_days = as.numeric(tstop - tstart))
+
+summary(selection_df$interval_days)          # overall
+tapply(selection_df$interval_days, selection_df$event, summary)  # by event=0/1
+
+# ---- Groups + singletons + IDs  ----
+
+group_map <- list(
+  water_source     = intersect(c("water_piped_inside","water_piped_outside","water_borehole","water_unprotected"),                         names(selection_df)),
+  utensil_washing  = intersect(c("utensil_piped_inside","utensil_piped_outside","utensil_river","utensil_borehole","utensil_unprotected"), names(selection_df)),
+  bathe_location   = intersect(c("bathe_bottled","bathe_piped_inside","bathe_piped_outside","bathe_borehole","bathe_unprotected"),          names(selection_df)),
+  perishable_food  = intersect(c("food_container","food_refrigerator","food_cupboard","food_surfaces"),                                     names(selection_df)),
+  public_transport = intersect(c("tpt_year","tpt_month","tpt_week","tpt_daily"),                                                            names(selection_df)),
+  leave_ndirande   = intersect(c("ndir_year","ndir_month","ndir_week","ndir_daily"),                                                         names(selection_df)),
+  meat_frequency   = intersect(c("meat_month","meat_year","meat_daily","meat_never"),                                                        names(selection_df)),
+  fish_frequency   = intersect(c("fish_month","fish_daily","fish_never"),                                                                    names(selection_df))
+)
+
+singletons <- intersect(c(
+  "is_adult","is_child",
+  "days_out_day_z","days_out_eve_z","cls_contactnum_z","sleep_next_z",
+  "attend_worship","goto_market","eat_atcafe",
+  "attend_bar","smoke_adult","drink_alcohol_adult",
+  "attend_school_child",
+  "hiv_reactive","hiv_unknown",
+  "toilet_type_binary","water_treated","hand_index_z","veg_handling_index_z",
+  "standing_rainwater","flood_last_year","shared_plates","river_water_contact",
+  "hard_floor","keep_animals","hh_visitors","river_distance_z", "hours_in_house_z"
+), names(selection_df))
+
+# Column -> group id (parents share an id; singletons each get a new id)
+col_group_id <- {
+  parent_ids <- rep(seq_along(group_map), sapply(group_map, length))
+  names(parent_ids) <- unlist(group_map, use.names = FALSE)
+  singleton_ids <- setNames(seq_along(singletons) + length(group_map), singletons)
+  c(parent_ids, singleton_ids)
+}
+
+# Predictor names to feed the selection process
+selection_predictors <- names(col_group_id)
+
+surv_first_episode <- Surv(time = selection_df$tstart_num, time2 = selection_df$tstop_num, event = selection_df$event)
+
+variable_selection_matrix <- as.matrix(selection_df[, selection_predictors])
+
+
+selection_df <- selection_df %>%
+  dplyr::left_join(
+    hh_wealth %>% dplyr::select(hhid, wealth_index) %>%
+      dplyr::rename(wealth_index_z = wealth_index),
+    by = "hhid"
+  )
+
+selection_df <- selection_df %>%
+  dplyr::left_join(
+    B_raw %>% dplyr::select(pid, age_yr) %>% dplyr::distinct(pid, .keep_all = TRUE),
+    by = "pid"
+  ) %>%
+  dplyr::mutate(
+    age_yr   = as.numeric(age_yr),
+    age_yr_z = (age_yr - mean(age_yr, na.rm = TRUE)) / sd(age_yr, na.rm = TRUE)
+  )
+
+# Drop the raw age column to avoid confusion
+selection_df <- selection_df %>% dplyr::select(-age_yr)
+
+selection_df <- selection_df %>%
+  dplyr::left_join(
+    B_raw %>% dplyr::select(pid, sex) %>% dplyr::distinct(pid, .keep_all = TRUE),
+    by = "pid"
+  )
+
+# Columns NOT to use as predictors
+exclude_cols <- c(
+  "pid","hhid",
+  "tstart","tstop","tstart_num","tstop_num","interval_days",
+  "event",
+  "age_yr_z","sex","wealth_index_z"
+)
+
+predictor_names <- setdiff(colnames(selection_df), exclude_cols)
+
+# Archive the prepared analysis objects used by the downstream selection workflow.
+dir.create(here::here("outputs", "reproducibility"), recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(
+  list(
+    A = A,
+    B = B,
+    A_raw = A_raw,
+    B_raw = B_raw,
+    hh_wealth = hh_wealth,
+    river = river,
+    episodes_df = episodes_df,
+    followup_df = followup_df,
+    selection_df = selection_df,
+    group_map = group_map,
+    col_group_id = col_group_id,
+    selection_predictors = selection_predictors
+  ),
+  here::here("outputs", "reproducibility", "variable_selection_inputs.rds")
+)
+
+```

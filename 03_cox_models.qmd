@@ -1,0 +1,760 @@
+---
+title: "TiNTS epidemiological analysis: Cox models"
+format: html
+execute:
+  echo: true
+  warning: true
+  message: true
+params:
+  project_root: "."
+  strict_reference_check: true
+editor: source
+---
+
+This document reconstructs the final covariates and reproduces the first-event Cox proportional-hazards model and Andersen–Gill recurrent-event model reported in the manuscript. It includes fail-fast checks against the archived manuscript estimates.
+
+## Setup
+
+```{r}
+options(stringsAsFactors = FALSE, scipen = 999)
+
+required_packages <- c("dplyr", "readr", "stringr", "tibble", "survival")
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following packages before rendering: ",
+    paste(missing_packages, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(tibble)
+  library(survival)
+})
+
+# Locate the TiNTS project root automatically.  The analysis script lives in
+# <project>/scripts, whereas data_raw/, data_clean/, and rds/ live one level
+# above it.  Quarto/RStudio may render with the working directory set either to
+# the project root or to scripts/, so do not assume that getwd() is the root.
+required_relative_files <- c(
+  file.path("data_raw", "CRF_A.csv"),
+  file.path("data_raw", "CRF_B_MCA.csv"),
+  file.path("data_clean", "wealth_index_by_household.csv"),
+  file.path("rds", "episodes_df.rds"),
+  file.path("rds", "followup_df.rds")
+)
+
+normalise_existing_dir <- function(x) {
+  if (is.null(x) || length(x) == 0L || is.na(x) || !nzchar(x)) return(NULL)
+  normalizePath(x, winslash = "/", mustWork = FALSE)
+}
+
+ancestor_dirs <- function(path, n = 8L) {
+  path <- normalise_existing_dir(path)
+  if (is.null(path)) return(character())
+  out <- path
+  for (i in seq_len(n)) {
+    parent <- dirname(out[length(out)])
+    if (identical(parent, out[length(out)])) break
+    out <- c(out, parent)
+  }
+  unique(out)
+}
+
+qmd_dir <- tryCatch({
+  input <- knitr::current_input(dir = TRUE)
+  if (is.null(input) || !nzchar(input)) NULL else dirname(normalise_existing_dir(input))
+}, error = function(e) NULL)
+
+quarto_project_dir <- normalise_existing_dir(Sys.getenv("QUARTO_PROJECT_DIR", unset = ""))
+explicit_root <- normalise_existing_dir(params$project_root)
+
+root_candidates <- unique(c(
+  ancestor_dirs(explicit_root),
+  ancestor_dirs(getwd()),
+  ancestor_dirs(qmd_dir),
+  ancestor_dirs(quarto_project_dir)
+))
+root_candidates <- root_candidates[nzchar(root_candidates)]
+
+is_tints_root <- function(path) {
+  all(file.exists(file.path(path, required_relative_files)))
+}
+
+root_ok <- vapply(root_candidates, is_tints_root, logical(1))
+
+if (!any(root_ok)) {
+  searched <- if (length(root_candidates)) {
+    paste0("- ", root_candidates, collapse = "\n")
+  } else {
+    "- <no candidate directories resolved>"
+  }
+  stop(
+    "Could not locate the TiNTS project root automatically.\n",
+    "I looked for these five required files beneath each candidate root:\n- ",
+    paste(required_relative_files, collapse = "\n- "),
+    "\n\nDirectories searched:\n", searched,
+    "\n\nIf the project has moved, set params$project_root once to the folder that contains data_raw/, data_clean/, and rds/.",
+    call. = FALSE
+  )
+}
+
+root <- normalizePath(
+  root_candidates[which(root_ok)[1]],
+  winslash = "/",
+  mustWork = TRUE
+)
+
+message("TiNTS project root: ", root)
+
+project_file <- function(...) file.path(root, ...)
+
+input_files <- c(
+  crf_a    = project_file("data_raw", "CRF_A.csv"),
+  crf_b    = project_file("data_raw", "CRF_B_MCA.csv"),
+  wealth   = project_file("data_clean", "wealth_index_by_household.csv"),
+  episodes = project_file("rds", "episodes_df.rds"),
+  followup = project_file("rds", "followup_df.rds")
+)
+
+# This is deliberately retained as a second, explicit guard: if the root was
+# found but one of the required files subsequently disappears, fail clearly.
+missing_files <- input_files[!file.exists(input_files)]
+if (length(missing_files) > 0L) {
+  stop(
+    "Required input file(s) not found beneath detected project root ", root, ":\n",
+    paste0("- ", missing_files, collapse = "\n"),
+    call. = FALSE
+  )
+}
+
+
+
+assert_columns <- function(data, columns, object_name) {
+  absent <- setdiff(columns, names(data))
+  if (length(absent) > 0L) {
+    stop(
+      object_name, " is missing required column(s): ",
+      paste(absent, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  invisible(data)
+}
+
+clean_text <- function(x) stringr::str_squish(trimws(as.character(x)))
+
+yes_no <- function(x) {
+  x <- tolower(clean_text(x))
+  dplyr::case_when(
+    x == "yes" ~ 1L,
+    x == "no"  ~ 0L,
+    TRUE        ~ NA_integer_
+  )
+}
+
+safe_min_date <- function(x) {
+  if (all(is.na(x))) as.Date(NA) else min(x, na.rm = TRUE)
+}
+
+safe_max_date <- function(x) {
+  if (all(is.na(x))) as.Date(NA) else max(x, na.rm = TRUE)
+}
+```
+
+## Final-model covariates
+
+```{r}
+A_raw       <- readr::read_csv(input_files[["crf_a"]], show_col_types = FALSE)
+B_raw       <- readr::read_csv(input_files[["crf_b"]], show_col_types = FALSE)
+hh_wealth   <- readr::read_csv(input_files[["wealth"]], show_col_types = FALSE)
+episodes_df <- readr::read_rds(input_files[["episodes"]])
+followup_df <- readr::read_rds(input_files[["followup"]])
+
+assert_columns(
+  A_raw,
+  c(
+    "hhid", "hh_sourceofwater", "hh_watertreated",
+    "before_eatn", "before_prepfood", "after_toilet", "lookn_dirty",
+    "perishable_food", "hh_washing"
+  ),
+  "CRF_A.csv"
+)
+
+assert_columns(
+  B_raw,
+  c(
+    "pid", "hhid", "age_yr", "sex", "dys_leav_day", "cls_contactnum",
+    "eat_atcafe", "eat_meat", "eat_meatfreq", "eat_fish", "eat_fishfreq",
+    "hrs_spentnhouse", "leav_ndirnd"
+  ),
+  "CRF_B_MCA.csv"
+)
+
+assert_columns(hh_wealth, c("hhid", "wealth_index"), "wealth_index_by_household.csv")
+assert_columns(
+  episodes_df,
+  c("pid", "hhid", "episode_order", "onset_lower", "onset_upper", "end_upper"),
+  "episodes_df.rds"
+)
+assert_columns(followup_df, c("pid", "hhid", "first_obs", "last_obs"), "followup_df.rds")
+
+# Only the 12 elastic-net-selected predictor groups and the three
+# prespecified confounders are reconstructed here. These transformations
+# reproduce the final-model coding used for the manuscript analysis.
+
+drinking_sources_known <- c(
+  "Public tap/Standpipe",
+  "Piped into dwelling",
+  "Piped outside dwelling",
+  "Tube well / borehole",
+  "Tube well/borehole",
+  "Borehole",
+  "Unprotected well / spring",
+  "Unprotected well/spring"
+)
+
+food_storage_known <- c(
+  "Container",
+  "Dark cupboard",
+  "Eaten same day",
+  "Food is left on surfaces",
+  "Refrigerator"
+)
+
+A_covariates <- A_raw %>%
+  transmute(
+    hhid = as.character(hhid),
+    drinking_source = clean_text(hh_sourceofwater),
+    utensil_source = clean_text(hh_washing),
+    food_storage = clean_text(perishable_food),
+    water_treated = yes_no(hh_watertreated),
+    hand_before_eating = yes_no(before_eatn),
+    hand_before_food = yes_no(before_prepfood),
+    hand_after_toilet = yes_no(after_toilet),
+    hand_when_dirty = yes_no(lookn_dirty)
+  ) %>%
+  mutate(
+    drinking_water_binary = factor(
+      case_when(
+        is.na(drinking_source) ~ NA_character_,
+        !drinking_source %in% drinking_sources_known ~ NA_character_,
+        drinking_source %in% c("Piped into dwelling", "Piped outside dwelling") ~ "piped",
+        TRUE ~ "non_piped"
+      ),
+      levels = c("non_piped", "piped")
+    ),
+    utensils_washed_binary = factor(
+      case_when(
+        is.na(utensil_source) ~ NA_character_,
+        utensil_source %in% c("Piped into dwelling", "Piped outside dwelling") ~ "piped",
+        TRUE ~ "non_piped"
+      ),
+      levels = c("non_piped", "piped")
+    ),
+    food_storage_binary = factor(
+      case_when(
+        is.na(food_storage) ~ NA_character_,
+        !food_storage %in% food_storage_known ~ NA_character_,
+        food_storage == "Refrigerator" ~ "refrigerated",
+        TRUE ~ "unrefrigerated"
+      ),
+      levels = c("unrefrigerated", "refrigerated")
+    ),
+    hand_index = (
+      hand_before_eating + hand_before_food +
+        hand_after_toilet + hand_when_dirty
+    ) / 4
+  ) %>%
+  select(
+    hhid,
+    drinking_water_binary,
+    utensils_washed_binary,
+    food_storage_binary,
+    water_treated,
+    hand_index
+  )
+
+hours_midpoint <- c(
+  "Less than 5 hours"  = 2.5,
+  "5-8 hours"          = 6.5,
+  "9-13 hours"         = 11,
+  "14-19 hours"        = 16.5,
+  "More than 20 hours" = 22
+)
+
+B_covariates <- B_raw %>%
+  transmute(
+    pid = as.character(pid),
+    hhid = as.character(hhid),
+    age_yr = as.numeric(age_yr),
+    sex = as.character(sex),
+    days_out_day = as.integer(dys_leav_day),
+    cls_contactnum = as.integer(cls_contactnum),
+    eat_atcafe = yes_no(eat_atcafe),
+    leave_ndirande = clean_text(leav_ndirnd),
+    meat_eaten = clean_text(eat_meat),
+    meat_frequency_reported = clean_text(eat_meatfreq),
+    fish_eaten = clean_text(eat_fish),
+    fish_frequency_reported = clean_text(eat_fishfreq),
+    hours_category = clean_text(hrs_spentnhouse)
+  ) %>%
+  mutate(
+    ndir_leave_binary = factor(
+      case_when(
+        is.na(leave_ndirande) ~ NA_character_,
+        leave_ndirande %in% c("At least once a week", "Every day") ~ "regularly",
+        TRUE ~ "rarely"
+      ),
+      levels = c("rarely", "regularly")
+    ),
+    meat_frequency = case_when(
+      meat_eaten == "No" ~ "Never",
+      TRUE ~ meat_frequency_reported
+    ),
+    meat_freq_binary = factor(
+      case_when(
+        is.na(meat_frequency) ~ NA_character_,
+        meat_frequency %in% c("At least once a month", "Every day") ~ "regularly",
+        TRUE ~ "rarely"
+      ),
+      levels = c("rarely", "regularly")
+    ),
+    fish_frequency = case_when(
+      fish_eaten == "No" ~ "Never",
+      TRUE ~ fish_frequency_reported
+    ),
+    fish_freq_binary = factor(
+      case_when(
+        is.na(fish_frequency) ~ NA_character_,
+        fish_frequency %in% c("At least once a month", "Every day") ~ "regularly",
+        TRUE ~ "rarely"
+      ),
+      levels = c("rarely", "regularly")
+    ),
+    hours_in_house_num = unname(hours_midpoint[hours_category])
+  ) %>%
+  select(
+    pid, hhid, age_yr, sex,
+    days_out_day, cls_contactnum, eat_atcafe,
+    ndir_leave_binary, meat_freq_binary, fish_freq_binary,
+    hours_in_house_num
+  )
+
+wealth_covariate <- hh_wealth %>%
+  transmute(
+    hhid = as.character(hhid),
+    wealth_index_z = as.numeric(wealth_index)
+  )
+
+if (anyDuplicated(A_covariates$hhid)) {
+  stop("CRF A contains duplicate household IDs.", call. = FALSE)
+}
+if (anyDuplicated(B_covariates$pid)) {
+  stop("CRF B contains duplicate participant IDs.", call. = FALSE)
+}
+if (anyDuplicated(wealth_covariate$hhid)) {
+  stop("The wealth-index file contains duplicate household IDs.", call. = FALSE)
+}
+
+covariates <- B_covariates %>%
+  left_join(A_covariates, by = "hhid") %>%
+  left_join(wealth_covariate, by = "hhid")
+```
+
+## First-event Cox model
+
+```{r}
+episodes_df <- episodes_df %>%
+  mutate(
+    pid = as.character(pid),
+    hhid = as.character(hhid),
+    episode_order = as.integer(episode_order),
+    onset_lower = as.Date(onset_lower),
+    onset_upper = as.Date(onset_upper),
+    end_upper = as.Date(end_upper)
+  )
+
+followup_df <- followup_df %>%
+  mutate(
+    pid = as.character(pid),
+    hhid = as.character(hhid),
+    first_obs = as.Date(first_obs),
+    last_obs = as.Date(last_obs)
+  )
+
+first_events <- episodes_df %>%
+  filter(
+    episode_order == 1L,
+    !is.na(onset_lower),
+    !is.na(onset_upper)
+  ) %>%
+  transmute(
+    pid, hhid,
+    tstart = onset_lower,
+    tstop = onset_upper,
+    event = 1L
+  )
+
+first_censors <- followup_df %>%
+  anti_join(first_events %>% distinct(pid), by = "pid") %>%
+  transmute(
+    pid, hhid,
+    tstart = first_obs,
+    tstop = last_obs,
+    event = 0L
+  )
+
+selection_df <- bind_rows(first_events, first_censors) %>%
+  left_join(covariates, by = c("pid", "hhid")) %>%
+  mutate(
+    tstart = as.Date(tstart),
+    tstop = as.Date(tstop)
+  )
+
+study_start <- min(selection_df$tstart, na.rm = TRUE)
+
+selection_df <- selection_df %>%
+  mutate(
+    tstart_num = as.numeric(difftime(tstart, study_start, units = "days")),
+    tstop_num = as.numeric(difftime(tstop, study_start, units = "days"))
+  )
+
+final_model_terms <- c(
+  "drinking_water_binary",
+  "utensils_washed_binary",
+  "food_storage_binary",
+  "ndir_leave_binary",
+  "meat_freq_binary",
+  "fish_freq_binary",
+  "days_out_day",
+  "cls_contactnum",
+  "eat_atcafe",
+  "water_treated",
+  "hand_index",
+  "hours_in_house_num",
+  "age_yr",
+  "sex",
+  "wealth_index_z"
+)
+
+first_formula <- as.formula(
+  paste(
+    "Surv(tstart_num, tstop_num, event) ~",
+    paste(final_model_terms, collapse = " + ")
+  )
+)
+
+fit_first <- survival::coxph(
+  first_formula,
+  data = selection_df,
+  ties = "efron",
+  cluster = hhid,
+  na.action = na.omit,
+  model = TRUE,
+  x = TRUE,
+  y = TRUE
+)
+```
+
+## Andersen–Gill recurrent-event model
+
+```{r}
+# This reproduces the recurrent-event interval construction in the source
+# workflow: total time from each participant's episode-derived baseline, with
+# robust standard errors clustered by participant.
+
+person_dates <- episodes_df %>%
+  mutate(
+    start_proxy = coalesce(onset_lower, onset_upper),
+    end_proxy = coalesce(end_upper, onset_upper)
+  ) %>%
+  group_by(pid, hhid) %>%
+  summarise(
+    baseline_date = safe_min_date(start_proxy),
+    last_followup_date = safe_max_date(end_proxy),
+    .groups = "drop"
+  )
+
+ag_events <- episodes_df %>%
+  left_join(person_dates, by = c("pid", "hhid")) %>%
+  arrange(pid, episode_order) %>%
+  group_by(pid) %>%
+  mutate(
+    event_date = onset_upper,
+    episode_end = coalesce(end_upper, onset_upper),
+    start_date = if_else(
+      episode_order == 1L,
+      baseline_date,
+      lag(episode_end)
+    ),
+    stop_date = event_date,
+    event = 1L
+  ) %>%
+  ungroup() %>%
+  mutate(
+    tstart_num = as.numeric(difftime(start_date, baseline_date, units = "days")),
+    tstop_num = as.numeric(difftime(stop_date, baseline_date, units = "days"))
+  ) %>%
+  select(pid, hhid, tstart_num, tstop_num, event)
+
+censor_after_last <- episodes_df %>%
+  left_join(person_dates, by = c("pid", "hhid")) %>%
+  mutate(episode_end = coalesce(end_upper, onset_upper)) %>%
+  group_by(pid, hhid, baseline_date, last_followup_date) %>%
+  summarise(
+    last_episode_end = safe_max_date(episode_end),
+    .groups = "drop"
+  ) %>%
+  filter(
+    !is.na(last_followup_date),
+    !is.na(last_episode_end),
+    last_followup_date > last_episode_end
+  ) %>%
+  transmute(
+    pid, hhid,
+    tstart_num = as.numeric(difftime(last_episode_end, baseline_date, units = "days")),
+    tstop_num = as.numeric(difftime(last_followup_date, baseline_date, units = "days")),
+    event = 0L
+  )
+
+never_event_pids <- setdiff(
+  unique(selection_df$pid),
+  unique(episodes_df$pid)
+)
+
+never_event_censors <- selection_df %>%
+  filter(pid %in% never_event_pids) %>%
+  group_by(pid, hhid) %>%
+  summarise(
+    tstart_num = min(tstart_num, na.rm = TRUE),
+    tstop_num = max(tstop_num, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(
+    is.finite(tstart_num),
+    is.finite(tstop_num),
+    tstop_num > tstart_num
+  ) %>%
+  mutate(event = 0L)
+
+ag_intervals <- bind_rows(
+  ag_events,
+  censor_after_last,
+  never_event_censors
+) %>%
+  filter(
+    is.finite(tstart_num),
+    is.finite(tstop_num),
+    tstop_num > tstart_num
+  )
+
+analysis_ag <- ag_intervals %>%
+  left_join(
+    selection_df %>%
+      distinct(pid, .keep_all = TRUE) %>%
+      select(pid, hhid, all_of(final_model_terms)),
+    by = c("pid", "hhid")
+  )
+
+ag_formula <- as.formula(
+  paste(
+    "Surv(tstart_num, tstop_num, event) ~",
+    paste(final_model_terms, collapse = " + ")
+  )
+)
+
+fit_ag <- survival::coxph(
+  ag_formula,
+  data = analysis_ag,
+  ties = "efron",
+  cluster = pid,
+  na.action = na.omit,
+  model = TRUE,
+  x = TRUE,
+  y = TRUE
+)
+```
+
+## Extract and audit model estimates
+
+```{r}
+term_dictionary <- tribble(
+  ~term_id, ~prefix,
+  "drinking_water_binary",  "drinking_water_binary",
+  "utensils_washed_binary", "utensils_washed_binary",
+  "food_storage_binary",    "food_storage_binary",
+  "ndir_leave_binary",      "ndir_leave_binary",
+  "meat_freq_binary",       "meat_freq_binary",
+  "fish_freq_binary",       "fish_freq_binary",
+  "days_out_day",           "days_out_day",
+  "cls_contactnum",         "cls_contactnum",
+  "eat_atcafe",             "eat_atcafe",
+  "water_treated",          "water_treated",
+  "hand_index",             "hand_index",
+  "hours_in_house_num",     "hours_in_house_num",
+  "age_yr",                 "age_yr",
+  "sex",                    "sex",
+  "wealth_index_z",         "wealth_index_z"
+)
+
+map_model_term <- function(raw_term) {
+  hits <- term_dictionary$term_id[
+    startsWith(raw_term, term_dictionary$prefix)
+  ]
+  if (length(hits) != 1L) {
+    stop("Could not uniquely map model term: ", raw_term, call. = FALSE)
+  }
+  hits[[1]]
+}
+
+extract_clustered_cox <- function(fit, model_name) {
+  coefficient_table <- as.data.frame(summary(fit)$coefficients)
+
+  if (!"robust se" %in% names(coefficient_table)) {
+    stop(model_name, " did not return robust standard errors.", call. = FALSE)
+  }
+
+  p_column <- grep("^Pr\\(", names(coefficient_table), value = TRUE)[1]
+
+  tibble(
+    model = model_name,
+    raw_term = rownames(coefficient_table),
+    beta = coefficient_table[["coef"]],
+    robust_se = coefficient_table[["robust se"]],
+    p_value = coefficient_table[[p_column]]
+  ) %>%
+    mutate(
+      term_id = vapply(raw_term, map_model_term, character(1)),
+      hr = exp(beta),
+      lower = exp(beta - 1.96 * robust_se),
+      upper = exp(beta + 1.96 * robust_se)
+    ) %>%
+    select(model, term_id, hr, lower, upper, p_value)
+}
+
+model_results <- bind_rows(
+  extract_clustered_cox(fit_first, "First event"),
+  extract_clustered_cox(fit_ag, "First and recurrent events")
+)
+
+# Reference values reported in the manuscript and supplementary tables.
+# The refitted results must reproduce these values to two decimal places.
+reference_values <- tribble(
+  ~model, ~term_id, ~ref_hr, ~ref_lower, ~ref_upper,
+  "First event", "drinking_water_binary",  1.52, 0.81, 2.83,
+  "First event", "utensils_washed_binary", 0.32, 0.13, 0.76,
+  "First event", "water_treated",           1.56, 0.82, 3.00,
+  "First event", "hand_index",              1.11, 0.36, 3.37,
+  "First event", "food_storage_binary",     1.18, 0.48, 2.92,
+  "First event", "meat_freq_binary",        1.54, 0.99, 2.41,
+  "First event", "fish_freq_binary",        0.68, 0.39, 1.18,
+  "First event", "eat_atcafe",              0.25, 0.07, 0.84,
+  "First event", "ndir_leave_binary",       0.61, 0.30, 1.23,
+  "First event", "days_out_day",            1.14, 1.03, 1.26,
+  "First event", "cls_contactnum",          1.02, 1.00, 1.03,
+  "First event", "hours_in_house_num",      0.95, 0.91, 1.01,
+  "First event", "age_yr",                  1.00, 0.99, 1.02,
+  "First event", "sex",                     1.26, 0.78, 2.04,
+  "First event", "wealth_index_z",          1.23, 0.93, 1.64,
+  "First and recurrent events", "drinking_water_binary",  0.78, 0.56, 1.10,
+  "First and recurrent events", "utensils_washed_binary", 0.78, 0.43, 1.43,
+  "First and recurrent events", "water_treated",           1.21, 0.84, 1.74,
+  "First and recurrent events", "hand_index",              0.29, 0.14, 0.60,
+  "First and recurrent events", "food_storage_binary",     1.47, 0.89, 2.42,
+  "First and recurrent events", "meat_freq_binary",        0.81, 0.61, 1.08,
+  "First and recurrent events", "fish_freq_binary",        0.59, 0.41, 0.84,
+  "First and recurrent events", "eat_atcafe",              0.42, 0.21, 0.85,
+  "First and recurrent events", "ndir_leave_binary",       1.33, 0.88, 2.01,
+  "First and recurrent events", "days_out_day",            1.10, 1.04, 1.16,
+  "First and recurrent events", "cls_contactnum",          1.00, 0.99, 1.01,
+  "First and recurrent events", "hours_in_house_num",      1.00, 0.96, 1.03,
+  "First and recurrent events", "age_yr",                  1.00, 0.99, 1.01,
+  "First and recurrent events", "sex",                     1.24, 0.91, 1.71,
+  "First and recurrent events", "wealth_index_z",          1.08, 0.89, 1.30
+)
+
+validation <- full_join(
+  model_results,
+  reference_values,
+  by = c("model", "term_id")
+) %>%
+  mutate(
+    model_hr = sprintf("%.2f", hr),
+    model_lower = sprintf("%.2f", lower),
+    model_upper = sprintf("%.2f", upper),
+    reference_hr = sprintf("%.2f", ref_hr),
+    reference_lower = sprintf("%.2f", ref_lower),
+    reference_upper = sprintf("%.2f", ref_upper),
+    matches = !is.na(hr) & !is.na(ref_hr) &
+      model_hr == reference_hr &
+      model_lower == reference_lower &
+      model_upper == reference_upper
+  )
+
+first_event_count <- sum(fit_first$y[, 3])
+first_person_days <- sum(fit_first$y[, 2] - fit_first$y[, 1])
+ag_event_count <- sum(fit_ag$y[, 3])
+
+count_mismatch <-
+  !isTRUE(all.equal(as.numeric(first_event_count), 125)) ||
+  !isTRUE(all.equal(as.numeric(first_person_days), 6957)) ||
+  !isTRUE(all.equal(as.numeric(ag_event_count), 166))
+
+estimate_mismatch <- validation %>% filter(!matches | is.na(matches))
+
+if (nrow(model_results) != 30L) {
+  count_mismatch <- TRUE
+}
+
+if (nrow(estimate_mismatch) > 0L || count_mismatch) {
+  mismatch_text <- capture.output(
+    print(
+      estimate_mismatch %>%
+        select(
+          model, term_id,
+          model_hr, model_lower, model_upper,
+          reference_hr, reference_lower, reference_upper
+        ),
+      n = Inf
+    )
+  )
+
+  audit_message <- paste0(
+    "The refitted models do not reproduce the archived manuscript reference values.\n",
+    "First-event count/person-days: ", first_event_count, "/", first_person_days,
+    " (expected 125/6957). Recurrent-model events: ", ag_event_count,
+    " (expected 166). Model rows: ", nrow(model_results), " (expected 30).\n\n",
+    paste(mismatch_text, collapse = "\n"),
+    "\n\nResolve the data/model discrepancy before using these results."
+  )
+
+  if (isTRUE(params$strict_reference_check)) {
+    stop(audit_message, call. = FALSE)
+  } else {
+    warning(audit_message, call. = FALSE)
+  }
+}
+
+dir.create(project_file("outputs", "reproducibility"), recursive = TRUE, showWarnings = FALSE)
+readr::write_csv(
+  model_results %>% filter(model == "First event"),
+  project_file("outputs", "reproducibility", "cox_first_event_results.csv")
+)
+readr::write_csv(
+  model_results %>% filter(model == "First and recurrent events"),
+  project_file("outputs", "reproducibility", "cox_andersen_gill_results.csv")
+)
+readr::write_csv(
+  validation,
+  project_file("outputs", "reproducibility", "cox_reference_validation.csv")
+)
+```

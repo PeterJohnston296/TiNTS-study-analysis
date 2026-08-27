@@ -1,0 +1,3305 @@
+---
+title: "TiNTS epidemiological analysis: Ct-threshold sensitivity"
+format: html
+execute:
+  echo: true
+  warning: true
+  message: true
+editor: source
+---
+
+This document reproduces the Ct-threshold sensitivity analyses from Ct 30 to Ct 40. It reconstructs threshold-specific PCR series and episodes, repeats burden estimation, and refits the fixed first-event and recurrent-event Cox models. Plot-only sections are omitted; tabular outputs and the scenario manifest are retained.
+
+```{r}
+# ========================================================================
+# Ct THRESHOLD SENSITIVITY ANALYSIS — END TO END
+# ========================================================================
+#
+# Compares alternative PCR positivity definitions:
+# Ct <= 30, 32, 35, 36, 37.1 (primary), 38, 39 and 40.
+#
+# For each definition, the script:
+#   1. Reads the saved positive-sample CSV.
+#   2. Reconstructs longitudinal PCR status.
+#   3. Reconstructs episodes.
+#   4. Calculates duration, incidence and prevalence.
+#   5. Refits the fixed final first-event Cox model.
+#   6. Refits the fixed Andersen-Gill recurrent-event model.
+#   7. Produces comparison tables and an archived scenario manifest.
+#
+# Variable selection is deliberately not rerun.
+# Outputs are written beneath outputs/ct_threshold_sensitivity/.
+# Primary outputs are never overwritten.
+# Ct = 37.1 QC disagreement is informational and never stops the analysis.
+# ========================================================================
+
+# ========================================================================
+# 0. PACKAGES
+# ========================================================================
+
+required_packages <- c(
+  "tidyverse",
+  "here",
+  "survival",
+  "lubridate"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following required package(s) before running this script: ",
+    paste(missing_packages, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+invisible(
+  lapply(
+    required_packages,
+    function(package_name) {
+      suppressPackageStartupMessages(
+        library(package_name, character.only = TRUE)
+      )
+    }
+  )
+)
+
+
+# ========================================================================
+# 1. SETTINGS
+# ========================================================================
+
+set.seed(1)
+
+# Use 500 for development and 2000 for final manuscript results.
+N_BOOT <- 500L
+RUN_BOOTSTRAP <- TRUE
+
+PRIMARY_CT <- 37.1
+EXPECTED_CT_THRESHOLDS <- c(30, 32, 35, 36, 37.1, 38, 39, 40)
+
+PRIMARY_EXPECTED <- list(
+  n_positive_stools = 266L,
+  n_positive_participants = 158L,
+  n_episode_rows = 199L,
+  n_observed_onset = 166L,
+  n_completed = 126L,
+  mean_duration_days = 3.0,
+  median_duration_days = 2.0,
+  incidence_per_1000_pd = 14.76
+)
+
+# ========================================================================
+# 2. PATHS
+# ========================================================================
+
+sensitivity_input_dir <- here::here(
+  "data_clean",
+  "ct_threshold_sensitivity"
+)
+
+output_root <- here::here(
+  "outputs",
+  "ct_threshold_sensitivity"
+)
+
+output_tables <- file.path(output_root, "tables")
+output_figures <- file.path(output_root, "figures")
+output_rds <- file.path(output_root, "rds")
+output_logs <- file.path(output_root, "logs")
+
+invisible(
+  lapply(
+    c(output_tables, output_figures, output_rds, output_logs),
+    dir.create,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+)
+
+# ========================================================================
+# 3. GENERAL HELPERS
+# ========================================================================
+
+assert_file_exists <- function(path, description = "Input file") {
+  if (!file.exists(path)) {
+    stop(description, " not found: ", path, call. = FALSE)
+  }
+  invisible(path)
+}
+
+assert_columns <- function(dat, required_columns, object_name) {
+  missing_columns <- setdiff(required_columns, names(dat))
+
+  if (length(missing_columns) > 0L) {
+    stop(
+      object_name,
+      " is missing required column(s): ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  invisible(dat)
+}
+
+normalise_id <- function(x) {
+  out <- stringr::str_squish(as.character(x))
+  out[
+    is.na(out) |
+      out %in% c("", "NA", "N/A", "na", "n/a", ".")
+  ] <- NA_character_
+  out
+}
+
+normalise_text <- function(x) {
+  out <- stringr::str_squish(as.character(x))
+  out[
+    is.na(out) |
+      out %in% c("", "NA", "N/A", "na", "n/a", ".")
+  ] <- NA_character_
+  out
+}
+
+parse_numeric_safe <- function(x) {
+  suppressWarnings(
+    readr::parse_number(
+      as.character(x),
+      na = c("", "NA", "N/A", "na", "n/a", ".")
+    )
+  )
+}
+
+yes_no_numeric <- function(x, integer = FALSE) {
+  x_norm <- stringr::str_to_lower(normalise_text(x))
+
+  out <- dplyr::case_when(
+    x_norm == "yes" ~ 1,
+    x_norm == "no" ~ 0,
+    TRUE ~ NA_real_
+  )
+
+  if (integer) {
+    as.integer(out)
+  } else {
+    out
+  }
+}
+
+# Correctly handles common day-month-year and year-month-day formats.
+# Unparseable values become NA rather than stopping the analysis.
+to_date_safe <- function(x) {
+  if (inherits(x, "Date")) {
+    return(x)
+  }
+
+  if (inherits(x, "POSIXt")) {
+    return(as.Date(x))
+  }
+
+  x_chr <- normalise_text(x)
+
+  out <- suppressWarnings(
+    lubridate::dmy(x_chr, quiet = TRUE)
+  )
+
+  bad <- !is.na(x_chr) & is.na(out)
+
+  if (any(bad)) {
+    out_ymd <- suppressWarnings(
+      lubridate::ymd(x_chr[bad], quiet = TRUE)
+    )
+    out[bad] <- out_ymd
+  }
+
+  bad <- !is.na(x_chr) & is.na(out)
+
+  if (any(bad)) {
+    out_dmy_hms <- suppressWarnings(
+      lubridate::dmy_hms(x_chr[bad], quiet = TRUE)
+    )
+    out[bad] <- as.Date(out_dmy_hms)
+  }
+
+  bad <- !is.na(x_chr) & is.na(out)
+
+  if (any(bad)) {
+    out_ymd_hms <- suppressWarnings(
+      lubridate::ymd_hms(x_chr[bad], quiet = TRUE)
+    )
+    out[bad] <- as.Date(out_ymd_hms)
+  }
+
+  bad_final <- !is.na(x_chr) & is.na(out)
+
+  if (any(bad_final)) {
+    message(
+      "DATE QC: ",
+      sum(bad_final),
+      " date value(s) could not be parsed and will be omitted. Examples: ",
+      paste(head(unique(x_chr[bad_final]), 10), collapse = ", ")
+    )
+  }
+
+  as.Date(out)
+}
+
+safe_divide <- function(num, den) {
+  output_length <- max(length(num), length(den))
+
+  if (output_length == 0L) {
+    return(numeric())
+  }
+
+  num <- rep_len(as.numeric(num), output_length)
+  den <- rep_len(as.numeric(den), output_length)
+  out <- rep(NA_real_, output_length)
+  valid <- is.finite(num) & is.finite(den) & den > 0
+  out[valid] <- num[valid] / den[valid]
+  out
+}
+
+relative_change_percent <- function(x, reference) {
+  if (!is.finite(reference) || reference == 0) {
+    return(rep(NA_real_, length(x)))
+  }
+
+  100 * (x / reference - 1)
+}
+
+q_safe <- function(x, probability) {
+  x <- x[is.finite(x)]
+
+  if (length(x) == 0L) {
+    return(NA_real_)
+  }
+
+  as.numeric(
+    stats::quantile(
+      x,
+      probs = probability,
+      na.rm = TRUE,
+      names = FALSE
+    )
+  )
+}
+
+safe_max <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0L) NA_real_ else max(x)
+}
+
+ct_label <- function(x) {
+  stringr::str_replace(
+    format(x, scientific = FALSE, trim = TRUE),
+    "\\.",
+    "p"
+  )
+}
+
+format_range <- function(lower, upper, digits = 1L) {
+  dplyr::if_else(
+    is.finite(lower) & is.finite(upper),
+    paste0(round(lower, digits), "–", round(upper, digits)),
+    NA_character_
+  )
+}
+
+format_p_value <- function(p) {
+  dplyr::case_when(
+    !is.finite(p) ~ NA_character_,
+    p < 0.001 ~ "<0.001",
+    p < 0.01 ~ sprintf("%.3f", p),
+    TRUE ~ sprintf("%.2f", p)
+  )
+}
+
+write_log <- function(filename, lines) {
+  writeLines(
+    unique(as.character(lines)),
+    con = file.path(output_logs, filename),
+    useBytes = TRUE
+  )
+}
+
+interval_union_days <- function(start, stop) {
+  x <- tibble::tibble(
+    start = as.numeric(start),
+    stop = as.numeric(stop)
+  ) %>%
+    dplyr::filter(
+      is.finite(start),
+      is.finite(stop),
+      stop > start
+    ) %>%
+    dplyr::arrange(start, stop)
+
+  if (nrow(x) == 0L) {
+    return(0)
+  }
+
+  current_start <- x$start[1]
+  current_stop <- x$stop[1]
+  total <- 0
+
+  if (nrow(x) > 1L) {
+    for (i in seq.int(2L, nrow(x))) {
+      if (x$start[i] <= current_stop) {
+        current_stop <- max(current_stop, x$stop[i])
+      } else {
+        total <- total + (current_stop - current_start)
+        current_start <- x$start[i]
+        current_stop <- x$stop[i]
+      }
+    }
+  }
+
+  total + (current_stop - current_start)
+}
+
+empty_episode_table <- function() {
+  tibble::tibble(
+    pid = character(),
+    hhid = character(),
+    episode_order = integer(),
+    episode_id = character(),
+    n_pos = integer(),
+    singleton = logical(),
+    first_positive = as.Date(character()),
+    last_positive = as.Date(character()),
+    onset_lower = as.Date(character()),
+    onset_upper = as.Date(character()),
+    end_lower = as.Date(character()),
+    end_upper = as.Date(character())
+  )
+}
+
+empty_cox_results <- function() {
+  tibble::tibble(
+    threshold = numeric(),
+    model = character(),
+    term = character(),
+    beta = numeric(),
+    robust_se = numeric(),
+    HR = numeric(),
+    lo = numeric(),
+    hi = numeric(),
+    p = numeric(),
+    n_model = integer(),
+    n_events = integer()
+  )
+}
+
+empty_boot_results <- function() {
+  tibble::tibble(
+    mean_duration_days = numeric(),
+    median_duration_days = numeric(),
+    incidence_per_1000_person_days = numeric(),
+    person_time_prevalence_percent = numeric()
+  )
+}
+
+save_plot_safely <- function(plot, filename, width, height, dpi = 600) {
+  target <- file.path(output_figures, filename)
+
+  tryCatch(
+    {
+      ggplot2::ggsave(
+        filename = target,
+        plot = plot,
+        width = width,
+        height = height,
+        dpi = dpi,
+        bg = "white"
+      )
+      invisible(target)
+    },
+    error = function(e) {
+      write_log(
+        paste0(tools::file_path_sans_ext(filename), "_PLOT_ERROR.txt"),
+        conditionMessage(e)
+      )
+
+      message(
+        "Could not save ",
+        filename,
+        ": ",
+        conditionMessage(e),
+        ". Attempting a PNG fallback."
+      )
+
+      fallback <- file.path(
+        output_figures,
+        paste0(tools::file_path_sans_ext(filename), ".png")
+      )
+
+      tryCatch(
+        ggplot2::ggsave(
+          filename = fallback,
+          plot = plot,
+          width = width,
+          height = height,
+          dpi = dpi,
+          bg = "white"
+        ),
+        error = function(e2) {
+          write_log(
+            paste0(tools::file_path_sans_ext(filename), "_PNG_FALLBACK_ERROR.txt"),
+            conditionMessage(e2)
+          )
+          message(
+            "PNG fallback also failed: ",
+            conditionMessage(e2)
+          )
+        }
+      )
+
+      invisible(NULL)
+    }
+  )
+}
+
+# ========================================================================
+# 4. FIND SENSITIVITY CSVs
+# ========================================================================
+
+if (!dir.exists(sensitivity_input_dir)) {
+  stop(
+    "Sensitivity input directory not found: ",
+    sensitivity_input_dir,
+    call. = FALSE
+  )
+}
+
+sensitivity_files <- list.files(
+  sensitivity_input_dir,
+  pattern = "^PCR_positives_Ct_le_.*_sensitivity\\.csv$",
+  full.names = TRUE
+)
+
+if (length(sensitivity_files) == 0L) {
+  stop(
+    "No sensitivity CSVs found in: ",
+    sensitivity_input_dir,
+    call. = FALSE
+  )
+}
+
+scenario_manifest <- tibble::tibble(
+  sensitivity_file = sensitivity_files,
+  filename = basename(sensitivity_files)
+) %>%
+  dplyr::mutate(
+    threshold_text = stringr::str_match(
+      filename,
+      "^PCR_positives_Ct_le_([0-9]+(?:[p.][0-9]+)?)_sensitivity\\.csv$"
+    )[, 2],
+    threshold = suppressWarnings(
+      as.numeric(stringr::str_replace_all(threshold_text, "p", "."))
+    )
+  ) %>%
+  dplyr::filter(is.finite(threshold)) %>%
+  dplyr::arrange(threshold)
+
+if (nrow(scenario_manifest) == 0L) {
+  stop(
+    "Sensitivity CSVs were found, but no Ct threshold could be parsed from their filenames.",
+    call. = FALSE
+  )
+}
+
+duplicate_thresholds <- scenario_manifest %>%
+  dplyr::count(threshold, name = "n_files") %>%
+  dplyr::filter(n_files > 1L)
+
+if (nrow(duplicate_thresholds) > 0L) {
+  stop(
+    "More than one sensitivity CSV was found for Ct threshold(s): ",
+    paste(duplicate_thresholds$threshold, collapse = ", "),
+    ". Keep exactly one file per threshold.",
+    call. = FALSE
+  )
+}
+
+missing_expected_thresholds <- setdiff(
+  EXPECTED_CT_THRESHOLDS,
+  scenario_manifest$threshold
+)
+
+if (length(missing_expected_thresholds) > 0L) {
+  warning(
+    "No sensitivity file was found for expected Ct threshold(s): ",
+    paste(missing_expected_thresholds, collapse = ", "),
+    ". The available thresholds will still run.",
+    call. = FALSE
+  )
+}
+
+cat("\n=============================================\n")
+cat("Ct SENSITIVITY SCENARIOS\n")
+cat("=============================================\n")
+print(
+  scenario_manifest %>% dplyr::select(threshold, filename),
+  n = Inf
+)
+
+# ========================================================================
+# 5. LOAD DATA
+# ========================================================================
+
+pcr_input_path <- here::here(
+  "data_clean",
+  "bayesian_pcr_for_epi_analysis_28052025.csv"
+)
+
+a_input_path <- here::here("data_raw", "CRF_A.csv")
+b_input_path <- here::here("data_raw", "CRF_B_MCA.csv")
+wealth_input_path <- here::here(
+  "data_clean",
+  "wealth_index_by_household.csv"
+)
+
+assert_file_exists(pcr_input_path, "Longitudinal PCR file")
+assert_file_exists(a_input_path, "Household questionnaire file")
+assert_file_exists(b_input_path, "Individual questionnaire file")
+assert_file_exists(wealth_input_path, "Household wealth file")
+
+CRF_PCR <- readr::read_csv(pcr_input_path, show_col_types = FALSE)
+A_raw <- readr::read_csv(a_input_path, show_col_types = FALSE)
+B_raw <- readr::read_csv(b_input_path, show_col_types = FALSE)
+hh_wealth <- readr::read_csv(wealth_input_path, show_col_types = FALSE)
+
+assert_columns(
+  CRF_PCR,
+  c("pid", "data_date", "CT_Value"),
+  "CRF_PCR"
+)
+
+assert_columns(B_raw, c("pid", "hhid"), "B_raw")
+
+# Standardise key IDs before any joins.
+CRF_PCR <- CRF_PCR %>%
+  dplyr::mutate(
+    pid = normalise_id(pid),
+    dplyr::across(dplyr::any_of("hhid"), normalise_id),
+    dplyr::across(dplyr::any_of("ID"), normalise_id)
+  )
+
+A_raw <- A_raw %>%
+  dplyr::mutate(dplyr::across(dplyr::any_of("hhid"), normalise_id))
+
+B_raw <- B_raw %>%
+  dplyr::mutate(
+    pid = normalise_id(pid),
+    hhid = normalise_id(hhid)
+  )
+
+hh_wealth <- hh_wealth %>%
+  dplyr::mutate(dplyr::across(dplyr::any_of("hhid"), normalise_id))
+
+# ========================================================================
+# 6. PREPARE LONGITUDINAL PCR DATA
+# ========================================================================
+
+if (!"hhid" %in% names(CRF_PCR)) {
+  pid_hhid_lookup <- B_raw %>%
+    dplyr::select(pid, hhid) %>%
+    dplyr::filter(!is.na(pid), !is.na(hhid)) %>%
+    dplyr::distinct()
+
+  ambiguous_pid_hhid <- pid_hhid_lookup %>%
+    dplyr::count(pid, name = "n_hhid") %>%
+    dplyr::filter(n_hhid > 1L)
+
+  if (nrow(ambiguous_pid_hhid) > 0L) {
+    stop(
+      "Cannot attach hhid to CRF_PCR because at least one pid maps to multiple households.",
+      call. = FALSE
+    )
+  }
+
+  CRF_PCR <- CRF_PCR %>%
+    dplyr::left_join(pid_hhid_lookup, by = "pid")
+}
+
+pcr_master <- CRF_PCR %>%
+  dplyr::mutate(
+    hhid = normalise_id(hhid),
+    data_date = to_date_safe(data_date),
+    CT_numeric = parse_numeric_safe(CT_Value)
+  ) %>%
+  dplyr::filter(
+    !is.na(pid),
+    !is.na(hhid),
+    !is.na(data_date)
+  ) %>%
+  dplyr::arrange(pid, data_date)
+
+if (nrow(pcr_master) == 0L) {
+  stop(
+    "No usable longitudinal PCR observations remain after ID and date cleaning.",
+    call. = FALSE
+  )
+}
+
+cat("\n=============================================\n")
+cat("LONGITUDINAL PCR DATA\n")
+cat("=============================================\n")
+cat("Rows: ", nrow(pcr_master), "\n", sep = "")
+cat("Participants: ", dplyr::n_distinct(pcr_master$pid), "\n", sep = "")
+cat("Households: ", dplyr::n_distinct(pcr_master$hhid), "\n", sep = "")
+cat(
+  "Maximum numeric Ct retained in CRF_PCR: ",
+  ifelse(is.finite(safe_max(pcr_master$CT_numeric)), safe_max(pcr_master$CT_numeric), "NA"),
+  "\n\n",
+  sep = ""
+)
+
+
+# ------------------------------------------------------------------------
+# BUILD A BROADER ID -> PARTICIPANT/DATE LOOKUP FOR HIGH-Ct POSITIVES
+# ------------------------------------------------------------------------
+# The primary epidemiology file was built for the Ct <= 37.1 analysis. It can
+# therefore legitimately omit observations that only become positive at Ct 38,
+# 39 or 40. The saved threshold-specific positive CSVs remain authoritative for
+# positivity. To place any positive ID absent from pcr_master back onto the
+# participant timeline, discover the broadest PCR/stool CSV in data_raw or
+# data_clean that contains the SAME ID key plus pid and a collection date.
+#
+# This is deliberately a narrow augmentation of the original working workflow:
+#   * observations already present in pcr_master are never replaced;
+#   * Ct <= 37.1 therefore uses the same longitudinal frame as before;
+#   * only threshold-positive IDs missing from pcr_master are added;
+#   * no numerical Ct fallback is used for those missing observations.
+
+SENSITIVITY_ID_CANDIDATES <- c(
+  "ID", "stool_id", "sample_id", "sampleid", "Sample_ID", "SampleID"
+)
+
+DATE_CANDIDATES <- c(
+  "data_date", "sample_date", "collection_date", "collection_dt",
+  "date_collected", "Date", "date"
+)
+
+first_present <- function(nms, candidates) {
+  hit <- candidates[candidates %in% nms]
+  if (length(hit) == 0L) NA_character_ else hit[[1L]]
+}
+
+read_sensitivity_ids <- function(path) {
+  d <- readr::read_csv(path, show_col_types = FALSE)
+  id_col <- first_present(names(d), SENSITIVITY_ID_CANDIDATES)
+  if (is.na(id_col)) {
+    stop(
+      "Sensitivity file has no recognised sample-ID column: ", basename(path),
+      call. = FALSE
+    )
+  }
+  ids <- unique(normalise_id(d[[id_col]]))
+  ids[!is.na(ids)]
+}
+
+all_sensitivity_positive_ids <- unique(unlist(
+  purrr::map(sensitivity_files, read_sensitivity_ids),
+  use.names = FALSE
+))
+
+# Coverage already available in the primary longitudinal file.
+primary_id_col <- first_present(names(pcr_master), SENSITIVITY_ID_CANDIDATES)
+
+if (is.na(primary_id_col)) {
+  stop(
+    "The longitudinal PCR dataset has no recognised sample-ID column. ",
+    "Expected one of: ", paste(SENSITIVITY_ID_CANDIDATES, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+pcr_master <- pcr_master %>%
+  dplyr::mutate(.analysis_id = normalise_id(.data[[primary_id_col]]))
+
+primary_id_coverage <- length(intersect(
+  all_sensitivity_positive_ids,
+  unique(pcr_master$.analysis_id)
+))
+
+# Candidate source files. Restrict discovery to PCR/stool-looking CSVs to avoid
+# accidentally using an unrelated table that happens to contain ID and pid.
+candidate_dirs <- c(here::here("data_raw"), here::here("data_clean"))
+candidate_dirs <- candidate_dirs[dir.exists(candidate_dirs)]
+
+candidate_csvs <- unique(unlist(
+  lapply(candidate_dirs, function(d) {
+    list.files(d, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+  }),
+  use.names = FALSE
+))
+
+candidate_csvs <- candidate_csvs[
+  stringr::str_detect(
+    stringr::str_to_lower(basename(candidate_csvs)),
+    "pcr|stool"
+  )
+]
+
+# The sensitivity outputs themselves are positive-only files, so exclude them
+# from automatic lookup discovery unless they happen to contain full metadata;
+# they are handled separately within make_threshold_pcr().
+candidate_csvs <- setdiff(
+  normalizePath(candidate_csvs, winslash = "/", mustWork = FALSE),
+  normalizePath(sensitivity_files, winslash = "/", mustWork = FALSE)
+)
+
+inspect_lookup_candidate <- function(path) {
+  hdr <- tryCatch(
+    names(readr::read_csv(path, n_max = 0, show_col_types = FALSE)),
+    error = function(e) character()
+  )
+
+  id_col <- first_present(hdr, SENSITIVITY_ID_CANDIDATES)
+  pid_col <- first_present(hdr, c("pid", "PID", "participant_id", "participantid"))
+  date_col <- first_present(hdr, DATE_CANDIDATES)
+
+  if (is.na(id_col) || is.na(pid_col) || is.na(date_col)) {
+    return(tibble::tibble(
+      path = path,
+      id_col = id_col,
+      pid_col = pid_col,
+      date_col = date_col,
+      overlap = -1L,
+      n_unique_ids = NA_integer_
+    ))
+  }
+
+  ids <- tryCatch(
+    {
+      x <- readr::read_csv(
+        path,
+        col_select = dplyr::all_of(id_col),
+        show_col_types = FALSE,
+        progress = FALSE
+      )[[id_col]]
+      unique(normalise_id(x))
+    },
+    error = function(e) character()
+  )
+  ids <- ids[!is.na(ids)]
+
+  tibble::tibble(
+    path = path,
+    id_col = id_col,
+    pid_col = pid_col,
+    date_col = date_col,
+    overlap = length(intersect(all_sensitivity_positive_ids, ids)),
+    n_unique_ids = length(ids)
+  )
+}
+
+lookup_candidate_qc <- if (length(candidate_csvs) > 0L) {
+  purrr::map_dfr(candidate_csvs, inspect_lookup_candidate)
+} else {
+  tibble::tibble(
+    path = character(), id_col = character(), pid_col = character(),
+    date_col = character(), overlap = integer(), n_unique_ids = integer()
+  )
+}
+
+if (nrow(lookup_candidate_qc) > 0L) {
+  lookup_candidate_qc <- lookup_candidate_qc %>%
+    dplyr::arrange(dplyr::desc(overlap), dplyr::desc(n_unique_ids))
+}
+
+readr::write_csv(
+  lookup_candidate_qc,
+  file.path(output_tables, "PCR_LONGITUDINAL_LOOKUP_CANDIDATE_QC.csv")
+)
+
+best_lookup <- if (nrow(lookup_candidate_qc) > 0L) {
+  lookup_candidate_qc %>%
+    dplyr::filter(overlap >= 0L) %>%
+    dplyr::slice(1)
+} else {
+  tibble::tibble()
+}
+
+full_positive_lookup <- pcr_master %>%
+  dplyr::transmute(
+    .analysis_id,
+    pid,
+    hhid,
+    data_date,
+    lookup_source = "primary longitudinal file"
+  ) %>%
+  dplyr::filter(!is.na(.analysis_id)) %>%
+  dplyr::distinct()
+
+if (nrow(best_lookup) > 0L && best_lookup$overlap[[1L]] > primary_id_coverage) {
+  lookup_raw <- readr::read_csv(
+    best_lookup$path[[1L]],
+    show_col_types = FALSE,
+    progress = FALSE
+  )
+
+  lookup_id_col <- best_lookup$id_col[[1L]]
+  lookup_pid_col <- best_lookup$pid_col[[1L]]
+  lookup_date_col <- best_lookup$date_col[[1L]]
+  lookup_hhid_col <- first_present(names(lookup_raw), c("hhid", "HHID", "household_id"))
+
+  extra_lookup <- tibble::tibble(
+    .analysis_id = normalise_id(lookup_raw[[lookup_id_col]]),
+    pid = normalise_id(lookup_raw[[lookup_pid_col]]),
+    data_date = to_date_safe(lookup_raw[[lookup_date_col]]),
+    hhid_source = if (!is.na(lookup_hhid_col)) {
+      normalise_id(lookup_raw[[lookup_hhid_col]])
+    } else {
+      rep(NA_character_, nrow(lookup_raw))
+    }
+  ) %>%
+    dplyr::filter(
+      !is.na(.analysis_id),
+      !is.na(pid),
+      !is.na(data_date)
+    )
+
+  # Use CRF_B as the authoritative household crosswalk where needed.
+  pid_hhid_crosswalk <- B_raw %>%
+    dplyr::select(pid, hhid) %>%
+    dplyr::filter(!is.na(pid), !is.na(hhid)) %>%
+    dplyr::distinct()
+
+  extra_lookup <- extra_lookup %>%
+    dplyr::left_join(
+      pid_hhid_crosswalk %>% dplyr::rename(hhid_from_B = hhid),
+      by = "pid"
+    ) %>%
+    dplyr::mutate(hhid = dplyr::coalesce(hhid_source, hhid_from_B)) %>%
+    dplyr::filter(!is.na(hhid)) %>%
+    dplyr::transmute(
+      .analysis_id,
+      pid,
+      hhid,
+      data_date,
+      lookup_source = basename(best_lookup$path[[1L]])
+    ) %>%
+    dplyr::distinct()
+
+  full_positive_lookup <- dplyr::bind_rows(
+    full_positive_lookup,
+    extra_lookup
+  ) %>%
+    dplyr::distinct(.analysis_id, pid, hhid, data_date, .keep_all = TRUE)
+
+  message(
+    "High-Ct observation lookup: using ",
+    best_lookup$path[[1L]],
+    " (matches ", best_lookup$overlap[[1L]],
+    " of ", length(all_sensitivity_positive_ids),
+    " threshold-positive IDs; primary longitudinal file matches ",
+    primary_id_coverage, ")."
+  )
+} else {
+  message(
+    "No broader PCR/stool lookup improved on the primary longitudinal ID coverage. ",
+    "The sensitivity CSV metadata will be used directly for missing positives where possible."
+  )
+}
+
+# Audit ID multiplicity in the combined lookup. This is informational only;
+# ambiguity is evaluated only for IDs that actually need to be added.
+positive_lookup_qc <- full_positive_lookup %>%
+  dplyr::group_by(.analysis_id) %>%
+  dplyr::summarise(
+    n_pid = dplyr::n_distinct(pid),
+    n_hhid = dplyr::n_distinct(hhid),
+    n_dates = dplyr::n_distinct(data_date),
+    n_mappings = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(n_mappings), .analysis_id)
+
+readr::write_csv(
+  positive_lookup_qc,
+  file.path(output_tables, "PCR_POSITIVE_ID_LOOKUP_QC.csv")
+)
+# ========================================================================
+# 7. LOAD / PREPARE FIXED FOLLOW-UP
+# ========================================================================
+# Follow-up is independent of the Ct threshold. Prefer the original
+# followup_df used in Chapter 5; otherwise reconstruct it from PCR data.
+
+followup_rds_path <- here::here("rds", "followup_df.rds")
+
+if (file.exists(followup_rds_path)) {
+  followup_reference <- readr::read_rds(followup_rds_path)
+  assert_columns(
+    followup_reference,
+    c("pid", "first_obs", "last_obs"),
+    "followup_reference"
+  )
+
+  followup_reference <- followup_reference %>%
+    dplyr::mutate(
+      pid = normalise_id(pid),
+      dplyr::across(dplyr::any_of("hhid"), normalise_id),
+      first_obs = to_date_safe(first_obs),
+      last_obs = to_date_safe(last_obs)
+    )
+
+  message("Using original rds/followup_df.rds for follow-up denominators.")
+} else {
+  followup_reference <- pcr_master %>%
+    dplyr::group_by(pid, hhid) %>%
+    dplyr::summarise(
+      first_obs = min(data_date, na.rm = TRUE),
+      last_obs = max(data_date, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  message(
+    "followup_df.rds not found: reconstructed follow-up from longitudinal PCR data."
+  )
+}
+
+if (!"hhid" %in% names(followup_reference)) {
+  pid_hhid_lookup <- pcr_master %>%
+    dplyr::select(pid, hhid) %>%
+    dplyr::distinct()
+
+  ambiguous_pid_hhid <- pid_hhid_lookup %>%
+    dplyr::count(pid, name = "n_hhid") %>%
+    dplyr::filter(n_hhid > 1L)
+
+  if (nrow(ambiguous_pid_hhid) > 0L) {
+    stop(
+      "Cannot attach hhid to followup_reference because at least one pid maps to multiple households.",
+      call. = FALSE
+    )
+  }
+
+  followup_reference <- followup_reference %>%
+    dplyr::left_join(pid_hhid_lookup, by = "pid")
+}
+
+followup_reference <- followup_reference %>%
+  dplyr::mutate(
+    pid = normalise_id(pid),
+    hhid = normalise_id(hhid),
+    first_obs = to_date_safe(first_obs),
+    last_obs = to_date_safe(last_obs)
+  ) %>%
+  dplyr::filter(
+    !is.na(pid),
+    !is.na(hhid),
+    !is.na(first_obs),
+    !is.na(last_obs),
+    last_obs >= first_obs
+  ) %>%
+  dplyr::group_by(pid, hhid) %>%
+  dplyr::summarise(
+    first_obs = min(first_obs),
+    last_obs = max(last_obs),
+    .groups = "drop"
+  )
+
+followup_pid_duplicates <- followup_reference %>%
+  dplyr::count(pid, name = "n_rows") %>%
+  dplyr::filter(n_rows > 1L)
+
+if (nrow(followup_pid_duplicates) > 0L) {
+  stop(
+    "followup_reference contains pid values assigned to more than one hhid.",
+    call. = FALSE
+  )
+}
+
+# ========================================================================
+# 8. BUILD FIXED FINAL-MODEL HOUSEHOLD COVARIATES
+# ========================================================================
+
+required_a_columns <- c(
+  "hhid",
+  "hh_sourceofwater",
+  "hh_washing",
+  "perishable_food",
+  "hh_watertreated",
+  "before_eatn",
+  "before_prepfood",
+  "after_toilet",
+  "lookn_dirty"
+)
+
+assert_columns(A_raw, required_a_columns, "A_raw")
+
+A_final <- A_raw %>%
+  dplyr::mutate(
+    hhid = normalise_id(hhid),
+
+    hh_sourceofwater = normalise_text(hh_sourceofwater),
+    hh_sourceofwater_norm = stringr::str_to_lower(hh_sourceofwater),
+    drinking_water_binary = dplyr::case_when(
+      is.na(hh_sourceofwater_norm) ~ NA_character_,
+      hh_sourceofwater_norm %in% c(
+        "piped into dwelling",
+        "piped outside dwelling"
+      ) ~ "piped",
+      TRUE ~ "non_piped"
+    ),
+    drinking_water_binary = factor(
+      drinking_water_binary,
+      levels = c("non_piped", "piped")
+    ),
+
+    hh_washing = normalise_text(hh_washing),
+    hh_washing_norm = stringr::str_to_lower(hh_washing),
+    utensils_washed_binary = dplyr::case_when(
+      is.na(hh_washing_norm) ~ NA_character_,
+      hh_washing_norm %in% c(
+        "piped into dwelling",
+        "piped outside dwelling"
+      ) ~ "piped",
+      TRUE ~ "non_piped"
+    ),
+    utensils_washed_binary = factor(
+      utensils_washed_binary,
+      levels = c("non_piped", "piped")
+    ),
+
+    perishable_food = normalise_text(perishable_food),
+    perishable_food_norm = stringr::str_to_lower(perishable_food),
+    food_storage_binary = dplyr::case_when(
+      is.na(perishable_food_norm) ~ NA_character_,
+      perishable_food_norm == "refrigerator" ~ "refrigerated",
+      TRUE ~ "unrefrigerated"
+    ),
+    food_storage_binary = factor(
+      food_storage_binary,
+      levels = c("unrefrigerated", "refrigerated")
+    ),
+
+    water_treated = yes_no_numeric(hh_watertreated, integer = TRUE),
+    before_eatn = yes_no_numeric(before_eatn),
+    before_prepfood = yes_no_numeric(before_prepfood),
+    after_toilet = yes_no_numeric(after_toilet),
+    lookn_dirty = yes_no_numeric(lookn_dirty),
+    hand_index = (
+      before_eatn +
+        before_prepfood +
+        after_toilet +
+        lookn_dirty
+    ) / 4
+  ) %>%
+  dplyr::select(
+    hhid,
+    drinking_water_binary,
+    utensils_washed_binary,
+    food_storage_binary,
+    water_treated,
+    hand_index
+  ) %>%
+  dplyr::filter(!is.na(hhid)) %>%
+  dplyr::distinct(hhid, .keep_all = TRUE)
+
+# ========================================================================
+# 9. BUILD FIXED FINAL-MODEL INDIVIDUAL COVARIATES
+# ========================================================================
+
+required_b_columns <- c(
+  "pid",
+  "hhid",
+  "age_yr",
+  "sex",
+  "dys_leav_day",
+  "cls_contactnum",
+  "eat_atcafe",
+  "leav_ndirnd",
+  "eat_meat",
+  "eat_meatfreq",
+  "eat_fish",
+  "eat_fishfreq",
+  "hrs_spentnhouse"
+)
+
+assert_columns(B_raw, required_b_columns, "B_raw")
+assert_columns(hh_wealth, c("hhid", "wealth_index"), "hh_wealth")
+
+hours_map <- c(
+  "Less than 5 hours" = 2.5,
+  "5-8 hours" = 6.5,
+  "9-13 hours" = 11,
+  "14-19 hours" = 16.5,
+  "More than 20 hours" = 22
+)
+
+B_final <- B_raw %>%
+  dplyr::mutate(
+    pid = normalise_id(pid),
+    hhid = normalise_id(hhid),
+    age_yr = parse_numeric_safe(age_yr),
+    sex = normalise_text(sex),
+    sex = factor(sex),
+    days_out_day = parse_numeric_safe(dys_leav_day),
+    cls_contactnum = parse_numeric_safe(cls_contactnum),
+
+    eat_atcafe = yes_no_numeric(eat_atcafe, integer = TRUE),
+
+    leav_ndirnd = normalise_text(leav_ndirnd),
+    leav_ndirnd_norm = stringr::str_to_lower(leav_ndirnd),
+    ndir_leave_binary = dplyr::case_when(
+      is.na(leav_ndirnd_norm) ~ NA_character_,
+      leav_ndirnd_norm %in% c(
+        "at least once a week",
+        "every day"
+      ) ~ "regularly",
+      TRUE ~ "rarely"
+    ),
+    ndir_leave_binary = factor(
+      ndir_leave_binary,
+      levels = c("rarely", "regularly")
+    ),
+
+    # Preserve the primary-analysis coding: monthly OR daily = regularly.
+    eat_meat = normalise_text(eat_meat),
+    eat_meatfreq = normalise_text(eat_meatfreq),
+    meat_freq = dplyr::case_when(
+      stringr::str_to_lower(eat_meat) == "no" ~ "Never",
+      TRUE ~ eat_meatfreq
+    ),
+    meat_freq_norm = stringr::str_to_lower(meat_freq),
+    meat_freq_binary = dplyr::case_when(
+      is.na(meat_freq_norm) ~ NA_character_,
+      meat_freq_norm %in% c(
+        "at least once a month",
+        "every day"
+      ) ~ "regularly",
+      TRUE ~ "rarely"
+    ),
+    meat_freq_binary = factor(
+      meat_freq_binary,
+      levels = c("rarely", "regularly")
+    ),
+
+    # Preserve the primary-analysis coding for fish as well.
+    eat_fish = normalise_text(eat_fish),
+    eat_fishfreq = normalise_text(eat_fishfreq),
+    fish_freq = dplyr::case_when(
+      stringr::str_to_lower(eat_fish) == "no" ~ "Never",
+      TRUE ~ eat_fishfreq
+    ),
+    fish_freq_norm = stringr::str_to_lower(fish_freq),
+    fish_freq_binary = dplyr::case_when(
+      is.na(fish_freq_norm) ~ NA_character_,
+      fish_freq_norm %in% c(
+        "at least once a month",
+        "every day"
+      ) ~ "regularly",
+      TRUE ~ "rarely"
+    ),
+    fish_freq_binary = factor(
+      fish_freq_binary,
+      levels = c("rarely", "regularly")
+    ),
+
+    hrs_spentnhouse = normalise_text(hrs_spentnhouse),
+    hours_in_house_num = unname(hours_map[hrs_spentnhouse])
+  ) %>%
+  dplyr::select(
+    pid,
+    hhid,
+    age_yr,
+    sex,
+    days_out_day,
+    cls_contactnum,
+    eat_atcafe,
+    ndir_leave_binary,
+    meat_freq_binary,
+    fish_freq_binary,
+    hours_in_house_num
+  ) %>%
+  dplyr::filter(!is.na(pid), !is.na(hhid)) %>%
+  dplyr::distinct(pid, .keep_all = TRUE)
+
+wealth_final <- hh_wealth %>%
+  dplyr::transmute(
+    hhid = normalise_id(hhid),
+    wealth_index_z = parse_numeric_safe(wealth_index)
+  ) %>%
+  dplyr::filter(!is.na(hhid)) %>%
+  dplyr::distinct(hhid, .keep_all = TRUE)
+
+covariate_df <- B_final %>%
+  dplyr::left_join(A_final, by = "hhid") %>%
+  dplyr::left_join(wealth_final, by = "hhid") %>%
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::where(is.numeric),
+      function(x) dplyr::if_else(is.finite(x), x, NA_real_)
+    )
+  )
+
+# ========================================================================
+# 10. FIXED FINAL COX COVARIATES
+# ========================================================================
+
+final_covariates <- c(
+  "drinking_water_binary",
+  "utensils_washed_binary",
+  "food_storage_binary",
+  "ndir_leave_binary",
+  "meat_freq_binary",
+  "fish_freq_binary",
+  "days_out_day",
+  "cls_contactnum",
+  "eat_atcafe",
+  "water_treated",
+  "hand_index",
+  "hours_in_house_num",
+  "age_yr",
+  "sex",
+  "wealth_index_z"
+)
+# ========================================================================
+# 11. BUILD THRESHOLD-SPECIFIC LONGITUDINAL PCR SERIES
+# ========================================================================
+# Preferred method: where both datasets contain ID, use the saved positive
+# IDs directly. Fallback: apply the numerical threshold to longitudinal Ct.
+# QC discrepancies are logged but never stop the analysis.
+
+make_threshold_pcr <- function(sensitivity_file, threshold) {
+  sens_positive <- readr::read_csv(
+    sensitivity_file,
+    show_col_types = FALSE
+  )
+
+  expected_positive_rows <- nrow(sens_positive)
+  sens_id_col <- first_present(names(sens_positive), SENSITIVITY_ID_CANDIDATES)
+
+  if (is.na(sens_id_col)) {
+    stop(
+      "Ct <= ", threshold,
+      ": sensitivity CSV has no recognised sample-ID column.",
+      call. = FALSE
+    )
+  }
+
+  positive_ids <- unique(normalise_id(sens_positive[[sens_id_col]]))
+  positive_ids <- positive_ids[!is.na(positive_ids)]
+
+  if (length(positive_ids) == 0L) {
+    stop(
+      "Ct <= ", threshold,
+      ": sensitivity CSV contains no usable positive IDs.",
+      call. = FALSE
+    )
+  }
+
+  # ----------------------------------------------------------------------
+  # 1. Preserve the original working longitudinal series exactly.
+  # ----------------------------------------------------------------------
+  base <- pcr_master %>%
+    dplyr::mutate(
+      .analysis_id = normalise_id(.analysis_id),
+      CT_text_observed = normalise_text(CT_Value),
+      pcr_observed = !is.na(CT_text_observed) | .analysis_id %in% positive_ids,
+      pcr_pos = as.integer(.analysis_id %in% positive_ids)
+    ) %>%
+    dplyr::filter(pcr_observed) %>%
+    dplyr::select(pid, hhid, data_date, .analysis_id, pcr_pos)
+
+  base_positive_ids <- unique(base$.analysis_id[base$pcr_pos == 1L])
+  missing_positive_ids <- setdiff(positive_ids, base_positive_ids)
+
+  # ----------------------------------------------------------------------
+  # 2. Add ONLY threshold-positive observations absent from the primary
+  #    Ct<=37.1 longitudinal file.
+  # ----------------------------------------------------------------------
+  extra_positive_rows <- tibble::tibble(
+    pid = character(),
+    hhid = character(),
+    data_date = as.Date(character()),
+    .analysis_id = character(),
+    pcr_pos = integer()
+  )
+
+  if (length(missing_positive_ids) > 0L) {
+    # First attempt: use the broader automatically discovered PCR/stool lookup.
+    extra_lookup <- full_positive_lookup %>%
+      dplyr::filter(.analysis_id %in% missing_positive_ids) %>%
+      dplyr::select(.analysis_id, pid, hhid, data_date) %>%
+      dplyr::distinct()
+
+    # Second attempt: if a missing ID is still absent, use participant/date
+    # metadata carried inside the positive sensitivity CSV itself.
+    still_missing <- setdiff(
+      missing_positive_ids,
+      unique(extra_lookup$.analysis_id)
+    )
+
+    if (length(still_missing) > 0L) {
+      sens_pid_col <- first_present(
+        names(sens_positive),
+        c("pid", "PID", "participant_id", "participantid")
+      )
+      sens_date_col <- first_present(names(sens_positive), DATE_CANDIDATES)
+      sens_hhid_col <- first_present(
+        names(sens_positive),
+        c("hhid", "HHID", "household_id")
+      )
+
+      if (!is.na(sens_pid_col) && !is.na(sens_date_col)) {
+        sens_extra <- tibble::tibble(
+          .analysis_id = normalise_id(sens_positive[[sens_id_col]]),
+          pid = normalise_id(sens_positive[[sens_pid_col]]),
+          data_date = to_date_safe(sens_positive[[sens_date_col]]),
+          hhid_source = if (!is.na(sens_hhid_col)) {
+            normalise_id(sens_positive[[sens_hhid_col]])
+          } else {
+            rep(NA_character_, nrow(sens_positive))
+          }
+        ) %>%
+          dplyr::filter(
+            .analysis_id %in% still_missing,
+            !is.na(pid),
+            !is.na(data_date)
+          )
+
+        pid_hhid_crosswalk <- B_raw %>%
+          dplyr::select(pid, hhid) %>%
+          dplyr::filter(!is.na(pid), !is.na(hhid)) %>%
+          dplyr::distinct()
+
+        sens_extra <- sens_extra %>%
+          dplyr::left_join(
+            pid_hhid_crosswalk %>% dplyr::rename(hhid_from_B = hhid),
+            by = "pid"
+          ) %>%
+          dplyr::mutate(hhid = dplyr::coalesce(hhid_source, hhid_from_B)) %>%
+          dplyr::filter(!is.na(hhid)) %>%
+          dplyr::select(.analysis_id, pid, hhid, data_date) %>%
+          dplyr::distinct()
+
+        extra_lookup <- dplyr::bind_rows(extra_lookup, sens_extra) %>%
+          dplyr::distinct(.analysis_id, pid, hhid, data_date)
+      }
+    }
+
+    # An ID that maps to exactly duplicated technical rows is fine after
+    # distinct(). An ID that genuinely maps to >1 participant/date is written
+    # to QC and, rather than poisoning every scenario, only that ID is omitted
+    # from temporal augmentation with an explicit warning. This preserves the
+    # original working analysis while making ambiguity visible.
+    mapping_counts <- extra_lookup %>%
+      dplyr::count(.analysis_id, name = "n_mappings")
+
+    ambiguous_ids <- mapping_counts %>%
+      dplyr::filter(n_mappings > 1L) %>%
+      dplyr::pull(.analysis_id)
+
+    if (length(ambiguous_ids) > 0L) {
+      readr::write_csv(
+        extra_lookup %>% dplyr::filter(.analysis_id %in% ambiguous_ids),
+        file.path(
+          output_tables,
+          paste0("Ct_", ct_label(threshold), "_AMBIGUOUS_EXTRA_POSITIVE_IDS.csv")
+        )
+      )
+
+      warning(
+        "Ct <= ", threshold, ": ", length(ambiguous_ids),
+        " missing positive ID(s) had multiple participant/date mappings and ",
+        "could not be added safely. See threshold-specific QC. The scenario ",
+        "will continue, but the missing-ID count must be zero before final ",
+        "primary-analysis interpretation.",
+        call. = FALSE
+      )
+
+      extra_lookup <- extra_lookup %>%
+        dplyr::filter(!.analysis_id %in% ambiguous_ids)
+    }
+
+    extra_positive_rows <- extra_lookup %>%
+      dplyr::transmute(
+        pid,
+        hhid,
+        data_date,
+        .analysis_id,
+        pcr_pos = 1L
+      )
+  }
+
+  out_sample <- dplyr::bind_rows(base, extra_positive_rows)
+
+  # Collapse technical duplicates on the same participant-day. A day is
+  # positive if any contributing record is positive.
+  out <- out_sample %>%
+    dplyr::group_by(pid, hhid, data_date) %>%
+    dplyr::summarise(
+      pcr_pos = as.integer(any(pcr_pos == 1L, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(pid, data_date)
+
+  represented_positive_ids <- unique(out_sample$.analysis_id[out_sample$pcr_pos == 1L])
+  unresolved_positive_ids <- setdiff(positive_ids, represented_positive_ids)
+
+  if (length(unresolved_positive_ids) > 0L) {
+    writeLines(
+      unresolved_positive_ids,
+      file.path(
+        output_logs,
+        paste0(
+          "Ct_", ct_label(threshold),
+          "_UNRESOLVED_POSITIVE_IDS.txt"
+        )
+      )
+    )
+  }
+
+  observed_positive_days <- sum(out$pcr_pos == 1L, na.rm = TRUE)
+
+  message(
+    "Ct <= ", threshold,
+    " | saved positive rows = ", expected_positive_rows,
+    " | unique saved positive IDs = ", length(positive_ids),
+    " | positives already in primary longitudinal file = ", length(base_positive_ids),
+    " | extra positive observation rows added = ", nrow(extra_positive_rows),
+    " | unresolved positive IDs = ", length(unresolved_positive_ids),
+    " | reconstructed positive participant-days = ", observed_positive_days
+  )
+
+  qc <- tibble::tibble(
+    threshold = threshold,
+    sensitivity_file = basename(sensitivity_file),
+    sensitivity_id_column = sens_id_col,
+    longitudinal_id_column = primary_id_col,
+    saved_positive_rows = expected_positive_rows,
+    saved_unique_positive_ids = length(positive_ids),
+    positive_ids_present_in_primary_longitudinal = length(base_positive_ids),
+    positive_ids_missing_from_primary_longitudinal = length(missing_positive_ids),
+    extra_positive_rows_added = nrow(extra_positive_rows),
+    unresolved_positive_ids = length(unresolved_positive_ids),
+    reconstructed_positive_participant_days = observed_positive_days,
+    method = paste0(
+      "original longitudinal series + saved positive-ID augmentation from broader PCR/stool lookup; ",
+      "no high-Ct numeric fallback"
+    )
+  )
+
+  readr::write_csv(
+    qc,
+    file.path(
+      output_tables,
+      paste0("Ct_", ct_label(threshold), "_PCR_input_QC.csv")
+    )
+  )
+
+  out
+}
+
+# ========================================================================
+# 12. BUILD EPISODES
+# ========================================================================
+# Successive positives remain in one episode unless separated by at least
+# two observed PCR-negative stools. Onset is bounded where the immediately
+# preceding two observations are negative. Offset is observed where the
+# immediately following two observations are negative.
+
+build_one_person_episodes <- function(d) {
+  d <- d %>% dplyr::arrange(data_date)
+  positive_idx <- which(d$pcr_pos == 1L)
+
+  if (length(positive_idx) == 0L) {
+    return(empty_episode_table())
+  }
+
+  episode_group <- integer(length(positive_idx))
+  episode_group[1] <- 1L
+
+  if (length(positive_idx) > 1L) {
+    current_group <- 1L
+
+    for (k in seq.int(2L, length(positive_idx))) {
+      previous_positive_index <- positive_idx[k - 1L]
+      current_positive_index <- positive_idx[k]
+
+      between_indices <- if (
+        current_positive_index > previous_positive_index + 1L
+      ) {
+        seq.int(
+          previous_positive_index + 1L,
+          current_positive_index - 1L
+        )
+      } else {
+        integer(0)
+      }
+
+      n_negative_between <- if (length(between_indices) > 0L) {
+        sum(d$pcr_pos[between_indices] == 0L, na.rm = TRUE)
+      } else {
+        0L
+      }
+
+      if (n_negative_between >= 2L) {
+        current_group <- current_group + 1L
+      }
+
+      episode_group[k] <- current_group
+    }
+  }
+
+  purrr::map_dfr(
+    sort(unique(episode_group)),
+    function(g) {
+      idx <- positive_idx[episode_group == g]
+      first_idx <- min(idx)
+      last_idx <- max(idx)
+
+      first_positive <- d$data_date[first_idx]
+      last_positive <- d$data_date[last_idx]
+
+      onset_lower <- as.Date(NA_character_)
+
+      if (first_idx >= 3L) {
+        previous_two <- d$pcr_pos[seq.int(first_idx - 2L, first_idx - 1L)]
+
+        if (length(previous_two) == 2L && all(previous_two == 0L)) {
+          onset_lower <- d$data_date[first_idx - 1L]
+        }
+      }
+
+      onset_upper <- first_positive
+      end_lower <- as.Date(NA_character_)
+      end_upper <- as.Date(NA_character_)
+
+      if (last_idx + 2L <= nrow(d)) {
+        following_two <- d$pcr_pos[seq.int(last_idx + 1L, last_idx + 2L)]
+
+        if (length(following_two) == 2L && all(following_two == 0L)) {
+          end_lower <- d$data_date[last_idx + 1L]
+          end_upper <- d$data_date[last_idx + 2L]
+        }
+      }
+
+      tibble::tibble(
+        pid = d$pid[1],
+        hhid = d$hhid[1],
+        episode_order = as.integer(g),
+        episode_id = paste0(d$pid[1], "_E", g),
+        n_pos = as.integer(length(idx)),
+        singleton = length(idx) == 1L,
+        first_positive = first_positive,
+        last_positive = last_positive,
+        onset_lower = onset_lower,
+        onset_upper = onset_upper,
+        end_lower = end_lower,
+        end_upper = end_upper
+      )
+    }
+  )
+}
+
+build_episodes <- function(pcr_df) {
+  if (nrow(pcr_df) == 0L) {
+    return(empty_episode_table())
+  }
+
+  out <- pcr_df %>%
+    dplyr::group_by(pid, hhid) %>%
+    dplyr::group_split(.keep = TRUE) %>%
+    purrr::map_dfr(
+      function(d) {
+        tryCatch(
+          build_one_person_episodes(d),
+          error = function(e) {
+            message(
+              "Episode construction failed for pid ",
+              paste(unique(d$pid), collapse = ", "),
+              ": ",
+              conditionMessage(e),
+              ". Continuing."
+            )
+            empty_episode_table()
+          }
+        )
+      }
+    )
+
+  if (nrow(out) == 0L) {
+    return(empty_episode_table())
+  }
+
+  out %>% dplyr::arrange(pid, episode_order)
+}
+
+# ========================================================================
+# 13. BURDEN / DURATION ANALYSIS
+# ========================================================================
+
+calculate_burden <- function(
+    pcr_df,
+    episodes_df,
+    followup_df,
+    threshold,
+    padding_days = 1,
+    n_boot = N_BOOT,
+    run_bootstrap = RUN_BOOTSTRAP) {
+
+  followup_chapter <- followup_df %>%
+    dplyr::mutate(
+      first_obs = to_date_safe(first_obs),
+      last_obs = to_date_safe(last_obs),
+      first_obs_num = as.numeric(first_obs),
+      last_obs_num = as.numeric(last_obs),
+      followup_days = as.numeric(last_obs - first_obs)
+    ) %>%
+    dplyr::filter(
+      is.finite(followup_days),
+      followup_days > 0
+    )
+
+  episodes_base <- episodes_df %>%
+    dplyr::left_join(
+      followup_chapter %>%
+        dplyr::select(
+          pid,
+          hhid,
+          first_obs,
+          last_obs,
+          first_obs_num,
+          last_obs_num
+        ),
+      by = c("pid", "hhid")
+    ) %>%
+    dplyr::mutate(
+      observed_onset = !is.na(onset_lower) & !is.na(onset_upper),
+      observed_offset = !is.na(end_upper),
+      closed_episode = observed_onset & observed_offset,
+      episode_row_id = dplyr::row_number()
+    )
+
+  # ------------------------------------------------------------
+  # Non-at-risk windows
+  # ------------------------------------------------------------
+
+  nonrisk_windows <- episodes_base %>%
+    dplyr::mutate(
+      nonrisk_start_num = dplyr::case_when(
+        observed_onset ~ pmax(
+          as.numeric(onset_upper) - padding_days,
+          first_obs_num
+        ),
+        !observed_onset ~ first_obs_num,
+        TRUE ~ NA_real_
+      ),
+      nonrisk_stop_num = dplyr::case_when(
+        observed_offset ~ pmin(
+          as.numeric(end_upper),
+          last_obs_num
+        ),
+        !observed_offset ~ last_obs_num,
+        TRUE ~ NA_real_
+      )
+    ) %>%
+    dplyr::filter(
+      is.finite(nonrisk_start_num),
+      is.finite(nonrisk_stop_num),
+      nonrisk_stop_num > nonrisk_start_num
+    )
+
+  nonrisk_by_pid <- nonrisk_windows %>%
+    dplyr::group_by(pid, hhid) %>%
+    dplyr::summarise(
+      not_at_risk_days = interval_union_days(
+        nonrisk_start_num,
+        nonrisk_stop_num
+      ),
+      .groups = "drop"
+    )
+
+  # ------------------------------------------------------------
+  # Completed-episode duration
+  # onset = first positive - 1 day; offset = final positive + 1 day.
+  # ------------------------------------------------------------
+
+  duration_episode_df <- episodes_base %>%
+    dplyr::filter(closed_episode) %>%
+    dplyr::mutate(
+      duration_start_num = pmax(
+        as.numeric(first_positive) - padding_days,
+        first_obs_num
+      ),
+      duration_stop_num = pmin(
+        as.numeric(last_positive) + padding_days,
+        as.numeric(end_upper),
+        last_obs_num
+      ),
+      duration_days = duration_stop_num - duration_start_num,
+      duration_start = as.Date(
+        duration_start_num,
+        origin = "1970-01-01"
+      ),
+      duration_stop = as.Date(
+        duration_stop_num,
+        origin = "1970-01-01"
+      )
+    ) %>%
+    dplyr::filter(
+      is.finite(duration_days),
+      duration_days > 0
+    )
+
+  closed_days_by_pid <- duration_episode_df %>%
+    dplyr::group_by(pid, hhid) %>%
+    dplyr::summarise(
+      closed_episode_days = interval_union_days(
+        duration_start_num,
+        duration_stop_num
+      ),
+      .groups = "drop"
+    )
+
+  incidence_by_pid <- duration_episode_df %>%
+    dplyr::count(pid, hhid, name = "n_incidence_episodes")
+
+  person_time_df <- followup_chapter %>%
+    dplyr::left_join(nonrisk_by_pid, by = c("pid", "hhid")) %>%
+    dplyr::left_join(closed_days_by_pid, by = c("pid", "hhid")) %>%
+    dplyr::left_join(incidence_by_pid, by = c("pid", "hhid")) %>%
+    dplyr::mutate(
+      not_at_risk_days = tidyr::replace_na(not_at_risk_days, 0),
+      closed_episode_days = tidyr::replace_na(closed_episode_days, 0),
+      n_incidence_episodes = tidyr::replace_na(
+        n_incidence_episodes,
+        0L
+      ),
+      at_risk_days = pmax(
+        followup_days - not_at_risk_days,
+        0
+      ),
+      prevalence_denominator_days = at_risk_days + closed_episode_days
+    )
+
+  n_positive_stools <- sum(pcr_df$pcr_pos == 1L, na.rm = TRUE)
+  positive_rows <- pcr_df %>% dplyr::filter(pcr_pos == 1L)
+  n_positive_participants <- dplyr::n_distinct(positive_rows$pid)
+  n_positive_households <- dplyr::n_distinct(positive_rows$hhid)
+
+  durations <- duration_episode_df$duration_days
+  total_at_risk_days <- sum(person_time_df$at_risk_days, na.rm = TRUE)
+  total_episode_days <- sum(
+    person_time_df$closed_episode_days,
+    na.rm = TRUE
+  )
+  prevalence_denominator <- sum(
+    person_time_df$prevalence_denominator_days,
+    na.rm = TRUE
+  )
+
+  burden_summary <- tibble::tibble(
+    threshold = threshold,
+    n_pcr_observations = nrow(pcr_df),
+    n_positive_stools = n_positive_stools,
+    percent_stools_positive = safe_divide(
+      n_positive_stools,
+      nrow(pcr_df)
+    ) * 100,
+    n_positive_participants = n_positive_participants,
+    n_positive_households = n_positive_households,
+    n_episode_rows = nrow(episodes_base),
+    n_observed_onset = sum(
+      episodes_base$observed_onset,
+      na.rm = TRUE
+    ),
+    n_completed_episodes = nrow(duration_episode_df),
+    n_right_censored_observed_onset = sum(
+      episodes_base$observed_onset & !episodes_base$observed_offset,
+      na.rm = TRUE
+    ),
+    n_left_censored = sum(
+      !episodes_base$observed_onset,
+      na.rm = TRUE
+    ),
+    mean_duration_days = if (
+      length(durations) > 0L
+    ) {
+      mean(durations, na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    median_duration_days = if (
+      length(durations) > 0L
+    ) {
+      stats::median(durations, na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    q1_duration_days = q_safe(durations, 0.25),
+    q3_duration_days = q_safe(durations, 0.75),
+    total_episode_days = total_episode_days,
+    total_at_risk_days = total_at_risk_days,
+    incidence_per_1000_person_days = safe_divide(
+      nrow(duration_episode_df),
+      total_at_risk_days
+    ) * 1000,
+    person_time_prevalence_percent = safe_divide(
+      total_episode_days,
+      prevalence_denominator
+    ) * 100,
+    mean_duration_ci_low = NA_real_,
+    mean_duration_ci_high = NA_real_,
+    median_duration_ci_low = NA_real_,
+    median_duration_ci_high = NA_real_,
+    incidence_ci_low = NA_real_,
+    incidence_ci_high = NA_real_,
+    prevalence_ci_low = NA_real_,
+    prevalence_ci_high = NA_real_
+  )
+
+  # ------------------------------------------------------------
+  # Household bootstrap
+  # ------------------------------------------------------------
+
+  boot_results <- empty_boot_results()
+  cluster_ids <- unique(person_time_df$hhid[!is.na(person_time_df$hhid)])
+
+  if (
+    isTRUE(run_bootstrap) &&
+      n_boot > 0L &&
+      nrow(person_time_df) > 0L &&
+      length(cluster_ids) > 0L
+  ) {
+    bootstrap_once <- function(i) {
+      sampled_clusters <- sample(
+        cluster_ids,
+        length(cluster_ids),
+        replace = TRUE
+      )
+
+      person_boot <- purrr::map_dfr(
+        seq_along(sampled_clusters),
+        function(j) {
+          person_time_df %>%
+            dplyr::filter(hhid == sampled_clusters[j]) %>%
+            dplyr::mutate(bootstrap_cluster = j)
+        }
+      )
+
+      episode_boot <- purrr::map_dfr(
+        seq_along(sampled_clusters),
+        function(j) {
+          duration_episode_df %>%
+            dplyr::filter(hhid == sampled_clusters[j]) %>%
+            dplyr::mutate(bootstrap_cluster = j)
+        }
+      )
+
+      boot_duration <- episode_boot$duration_days
+      boot_at_risk <- sum(person_boot$at_risk_days, na.rm = TRUE)
+      boot_episode_days <- sum(
+        person_boot$closed_episode_days,
+        na.rm = TRUE
+      )
+      boot_prev_den <- sum(
+        person_boot$prevalence_denominator_days,
+        na.rm = TRUE
+      )
+
+      tibble::tibble(
+        mean_duration_days = if (
+          length(boot_duration) > 0L
+        ) {
+          mean(boot_duration, na.rm = TRUE)
+        } else {
+          NA_real_
+        },
+        median_duration_days = if (
+          length(boot_duration) > 0L
+        ) {
+          stats::median(boot_duration, na.rm = TRUE)
+        } else {
+          NA_real_
+        },
+        incidence_per_1000_person_days = safe_divide(
+          nrow(episode_boot),
+          boot_at_risk
+        ) * 1000,
+        person_time_prevalence_percent = safe_divide(
+          boot_episode_days,
+          boot_prev_den
+        ) * 100
+      )
+    }
+
+    boot_results <- purrr::map_dfr(
+      seq_len(as.integer(n_boot)),
+      function(i) {
+        tryCatch(
+          bootstrap_once(i),
+          error = function(e) {
+            tibble::tibble(
+              mean_duration_days = NA_real_,
+              median_duration_days = NA_real_,
+              incidence_per_1000_person_days = NA_real_,
+              person_time_prevalence_percent = NA_real_
+            )
+          }
+        )
+      }
+    )
+
+    summarise_boot_ci <- function(variable) {
+      x <- boot_results[[variable]]
+      x <- x[is.finite(x)]
+
+      if (length(x) == 0L) {
+        return(c(low = NA_real_, high = NA_real_))
+      }
+
+      c(
+        low = as.numeric(
+          stats::quantile(
+            x,
+            probs = 0.025,
+            na.rm = TRUE,
+            names = FALSE
+          )
+        ),
+        high = as.numeric(
+          stats::quantile(
+            x,
+            probs = 0.975,
+            na.rm = TRUE,
+            names = FALSE
+          )
+        )
+      )
+    }
+
+    ci_mean <- summarise_boot_ci("mean_duration_days")
+    ci_median <- summarise_boot_ci("median_duration_days")
+    ci_incidence <- summarise_boot_ci(
+      "incidence_per_1000_person_days"
+    )
+    ci_prevalence <- summarise_boot_ci(
+      "person_time_prevalence_percent"
+    )
+
+    burden_summary <- burden_summary %>%
+      dplyr::mutate(
+        mean_duration_ci_low = unname(ci_mean["low"]),
+        mean_duration_ci_high = unname(ci_mean["high"]),
+        median_duration_ci_low = unname(ci_median["low"]),
+        median_duration_ci_high = unname(ci_median["high"]),
+        incidence_ci_low = unname(ci_incidence["low"]),
+        incidence_ci_high = unname(ci_incidence["high"]),
+        prevalence_ci_low = unname(ci_prevalence["low"]),
+        prevalence_ci_high = unname(ci_prevalence["high"])
+      )
+  }
+
+  list(
+    burden_summary = burden_summary,
+    episodes_base = episodes_base,
+    duration_episode_df = duration_episode_df,
+    person_time_df = person_time_df,
+    boot_results = boot_results
+  )
+}
+# ========================================================================
+# 14. COX HELPERS
+# ========================================================================
+
+get_estimable_covariates <- function(dat, candidate_terms) {
+  terms <- intersect(candidate_terms, names(dat))
+
+  if (length(terms) == 0L || nrow(dat) == 0L) {
+    return(character())
+  }
+
+  # Re-evaluate after complete-case restriction until the retained term set
+  # is stable. This prevents a factor collapsing to one level only after
+  # another incomplete covariate has removed rows.
+  repeat {
+    complete_rows <- stats::complete.cases(dat[, terms, drop = FALSE])
+    dat_complete <- dat[complete_rows, , drop = FALSE]
+
+    if (nrow(dat_complete) == 0L) {
+      return(character())
+    }
+
+    keep <- vapply(
+      terms,
+      function(v) {
+        x <- dat_complete[[v]]
+        x <- x[!is.na(x)]
+        length(x) > 0L && dplyr::n_distinct(x) >= 2L
+      },
+      logical(1)
+    )
+
+    new_terms <- terms[keep]
+
+    if (identical(new_terms, terms)) {
+      return(terms)
+    }
+
+    terms <- new_terms
+
+    if (length(terms) == 0L) {
+      return(character())
+    }
+  }
+}
+
+prepare_cox_data <- function(dat, candidate_terms, cluster_variable) {
+  assert_columns(
+    dat,
+    c("tstart_num", "tstop_num", "event", cluster_variable),
+    "Cox analysis dataset"
+  )
+
+  base_dat <- dat %>%
+    dplyr::filter(
+      is.finite(tstart_num),
+      is.finite(tstop_num),
+      tstop_num > tstart_num,
+      !is.na(event),
+      !is.na(.data[[cluster_variable]])
+    )
+
+  terms <- get_estimable_covariates(base_dat, candidate_terms)
+
+  if (length(terms) > 0L) {
+    analysis_dat <- base_dat %>%
+      tidyr::drop_na(dplyr::all_of(terms)) %>%
+      dplyr::mutate(
+        dplyr::across(
+          dplyr::all_of(terms),
+          function(x) {
+            if (is.character(x)) factor(x) else x
+          }
+        ),
+        dplyr::across(dplyr::where(is.factor), forcats::fct_drop)
+      )
+
+    # One final check after factor conversion and listwise deletion.
+    terms <- get_estimable_covariates(analysis_dat, terms)
+
+    if (length(terms) > 0L) {
+      analysis_dat <- analysis_dat %>%
+        tidyr::drop_na(dplyr::all_of(terms)) %>%
+        dplyr::mutate(
+          dplyr::across(dplyr::where(is.factor), forcats::fct_drop)
+        )
+    }
+  } else {
+    analysis_dat <- base_dat
+  }
+
+  list(data = analysis_dat, covariates = terms)
+}
+
+build_cox_formula <- function(covariates) {
+  if (length(covariates) == 0L) {
+    stats::as.formula(
+      "survival::Surv(tstart_num, tstop_num, event) ~ 1"
+    )
+  } else {
+    stats::reformulate(
+      termlabels = covariates,
+      response = "survival::Surv(tstart_num, tstop_num, event)"
+    )
+  }
+}
+
+extract_cox_results <- function(fit, threshold, model_name) {
+  if (is.null(fit)) {
+    return(empty_cox_results())
+  }
+
+  s <- summary(fit)
+  co <- as.data.frame(s$coefficients, check.names = FALSE)
+
+  if (nrow(co) == 0L) {
+    return(empty_cox_results())
+  }
+
+  se_col <- if ("robust se" %in% names(co)) {
+    "robust se"
+  } else if ("se(coef)" %in% names(co)) {
+    "se(coef)"
+  } else {
+    stop("No standard-error column was found in the Cox model summary.")
+  }
+
+  p_col <- grep("^Pr\\(", names(co), value = TRUE)
+  p_values <- if (length(p_col) > 0L) {
+    as.numeric(co[[p_col[1]]])
+  } else {
+    rep(NA_real_, nrow(co))
+  }
+
+  beta <- as.numeric(co[["coef"]])
+  robust_se <- as.numeric(co[[se_col]])
+  term_names <- rownames(co)
+
+  if (is.null(term_names) || length(term_names) != nrow(co)) {
+    term_names <- paste0("term_", seq_len(nrow(co)))
+  }
+
+  n_model <- if (!is.null(fit$n)) as.integer(fit$n) else NA_integer_
+  n_events <- if (!is.null(fit$nevent)) {
+    as.integer(fit$nevent)
+  } else {
+    NA_integer_
+  }
+
+  tibble::tibble(
+    threshold = rep(threshold, nrow(co)),
+    model = rep(model_name, nrow(co)),
+    term = term_names,
+    beta = beta,
+    robust_se = robust_se,
+    HR = exp(beta),
+    lo = exp(beta - 1.96 * robust_se),
+    hi = exp(beta + 1.96 * robust_se),
+    p = p_values,
+    n_model = rep(n_model, nrow(co)),
+    n_events = rep(n_events, nrow(co))
+  )
+}
+
+fit_cox_safely <- function(
+    analysis_data,
+    formula,
+    cluster_variable,
+    threshold,
+    model_stub,
+    model_name) {
+
+  if (nrow(analysis_data) == 0L) {
+    stop("No analysable rows remain after data preparation.")
+  }
+
+  if (sum(analysis_data$event == 1L, na.rm = TRUE) == 0L) {
+    stop("No events remain in the model dataset.")
+  }
+
+  if (dplyr::n_distinct(analysis_data[[cluster_variable]]) < 2L) {
+    stop("Fewer than two independent clusters remain in the model dataset.")
+  }
+
+  analysis_data <- analysis_data %>%
+    dplyr::mutate(
+      .cluster_id_internal = .data[[cluster_variable]]
+    )
+
+  warning_log <- character()
+
+  fit <- withCallingHandlers(
+    survival::coxph(
+      formula = formula,
+      data = analysis_data,
+      ties = "efron",
+      cluster = .cluster_id_internal,
+      model = TRUE,
+      x = TRUE
+    ),
+    warning = function(w) {
+      warning_log <<- c(warning_log, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  if (length(warning_log) > 0L) {
+    write_log(
+      paste0(
+        "Ct_",
+        ct_label(threshold),
+        "_",
+        model_stub,
+        "_warnings.txt"
+      ),
+      warning_log
+    )
+  }
+
+  list(
+    fit = fit,
+    results = extract_cox_results(fit, threshold, model_name)
+  )
+}
+
+# ========================================================================
+# 15. FIRST-EVENT COX MODEL
+# ========================================================================
+# Event interval: onset_lower -> onset_upper.
+# Censor interval: first_obs -> last_obs.
+# Participants positive at baseline (left-censored first episode) are
+# excluded rather than incorrectly treated as event-free censored subjects.
+# Robust standard errors are clustered by household.
+
+fit_first_event_model <- function(episodes_df, followup_df, threshold) {
+  tryCatch(
+    {
+      left_censored_first_pids <- episodes_df %>%
+        dplyr::filter(
+          episode_order == 1L,
+          is.na(onset_lower) | is.na(onset_upper)
+        ) %>%
+        dplyr::distinct(pid)
+
+      eligible_followup <- followup_df %>%
+        dplyr::anti_join(left_censored_first_pids, by = "pid")
+
+      events_first <- episodes_df %>%
+        dplyr::filter(
+          episode_order == 1L,
+          !is.na(onset_lower),
+          !is.na(onset_upper)
+        ) %>%
+        dplyr::transmute(
+          pid,
+          hhid,
+          tstart = onset_lower,
+          tstop = onset_upper,
+          event = 1L
+        )
+
+      censors <- eligible_followup %>%
+        dplyr::anti_join(
+          events_first %>% dplyr::distinct(pid),
+          by = "pid"
+        ) %>%
+        dplyr::transmute(
+          pid,
+          hhid,
+          tstart = first_obs,
+          tstop = last_obs,
+          event = 0L
+        )
+
+      selection_threshold <- dplyr::bind_rows(
+        events_first,
+        censors
+      ) %>%
+        dplyr::left_join(
+          covariate_df,
+          by = c("pid", "hhid")
+        )
+
+      if (nrow(selection_threshold) == 0L) {
+        stop("No eligible first-event or censoring records are available.")
+      }
+
+      study_start <- min(selection_threshold$tstart, na.rm = TRUE)
+
+      if (!is.finite(as.numeric(study_start))) {
+        stop("A valid study start date could not be determined.")
+      }
+
+      selection_threshold <- selection_threshold %>%
+        dplyr::mutate(
+          tstart_num = as.numeric(tstart - study_start),
+          tstop_num = as.numeric(tstop - study_start)
+        )
+
+      prepared <- prepare_cox_data(
+        selection_threshold,
+        final_covariates,
+        cluster_variable = "hhid"
+      )
+
+      if (length(prepared$covariates) == 0L) {
+        stop("No final-model covariates are estimable in the first-event data.")
+      }
+
+      formula_first <- build_cox_formula(prepared$covariates)
+
+      fitted <- fit_cox_safely(
+        analysis_data = prepared$data,
+        formula = formula_first,
+        cluster_variable = "hhid",
+        threshold = threshold,
+        model_stub = "first_event",
+        model_name = "First event"
+      )
+
+      list(
+        fit = fitted$fit,
+        data = prepared$data,
+        results = fitted$results
+      )
+    },
+    error = function(e) {
+      message(
+        "Ct ",
+        threshold,
+        ": first-event Cox model failed: ",
+        conditionMessage(e),
+        ". Continuing."
+      )
+
+      write_log(
+        paste0(
+          "Ct_",
+          ct_label(threshold),
+          "_first_event_ERROR.txt"
+        ),
+        conditionMessage(e)
+      )
+
+      list(
+        fit = NULL,
+        data = tibble::tibble(),
+        results = empty_cox_results()
+      )
+    }
+  )
+}
+
+# ========================================================================
+# 16. ANDERSEN-GILL RECURRENT-EVENT MODEL
+# ========================================================================
+# Total-time counting-process implementation. Only episodes with observed
+# onset are counted as incident events. A left-censored baseline episode is
+# not counted, and follow-up restarts after its observed offset. Participants
+# are removed from the risk set during an episode. Follow-up after the final
+# completed episode is correctly censored at last_obs.
+# Robust standard errors are clustered by participant.
+
+build_one_person_ag_intervals <- function(followup_row, person_episodes) {
+  pid_value <- followup_row$pid[1]
+  hhid_value <- followup_row$hhid[1]
+  first_obs <- followup_row$first_obs[1]
+  last_obs <- followup_row$last_obs[1]
+
+  if (
+    is.na(first_obs) ||
+      is.na(last_obs) ||
+      last_obs <= first_obs
+  ) {
+    return(
+      tibble::tibble(
+        pid = character(),
+        hhid = character(),
+        tstart_num = numeric(),
+        tstop_num = numeric(),
+        event = integer()
+      )
+    )
+  }
+
+  person_episodes <- person_episodes %>%
+    dplyr::arrange(episode_order)
+
+  interval_rows <- list()
+  row_index <- 0L
+  risk_start <- first_obs
+  risk_open <- TRUE
+
+  if (nrow(person_episodes) > 0L) {
+    for (episode_index in seq_len(nrow(person_episodes))) {
+      episode <- person_episodes[episode_index, , drop = FALSE]
+      observed_onset <- !is.na(episode$onset_lower) &&
+        !is.na(episode$onset_upper)
+      observed_offset <- !is.na(episode$end_upper)
+
+      if (!observed_onset) {
+        # Baseline/left-censored positivity contributes no incident event.
+        if (observed_offset && episode$end_upper < last_obs) {
+          risk_start <- max(risk_start, episode$end_upper)
+          risk_open <- TRUE
+        } else {
+          risk_open <- FALSE
+          break
+        }
+        next
+      }
+
+      event_stop <- min(episode$onset_upper, last_obs)
+
+      if (risk_open && event_stop > risk_start) {
+        row_index <- row_index + 1L
+        interval_rows[[row_index]] <- tibble::tibble(
+          pid = pid_value,
+          hhid = hhid_value,
+          tstart_num = as.numeric(risk_start - first_obs),
+          tstop_num = as.numeric(event_stop - first_obs),
+          event = 1L
+        )
+      }
+
+      if (observed_offset && episode$end_upper < last_obs) {
+        risk_start <- max(event_stop, episode$end_upper)
+        risk_open <- TRUE
+      } else {
+        risk_open <- FALSE
+        break
+      }
+    }
+  }
+
+  if (risk_open && last_obs > risk_start) {
+    row_index <- row_index + 1L
+    interval_rows[[row_index]] <- tibble::tibble(
+      pid = pid_value,
+      hhid = hhid_value,
+      tstart_num = as.numeric(risk_start - first_obs),
+      tstop_num = as.numeric(last_obs - first_obs),
+      event = 0L
+    )
+  }
+
+  if (length(interval_rows) == 0L) {
+    tibble::tibble(
+      pid = character(),
+      hhid = character(),
+      tstart_num = numeric(),
+      tstop_num = numeric(),
+      event = integer()
+    )
+  } else {
+    dplyr::bind_rows(interval_rows)
+  }
+}
+
+fit_ag_model <- function(episodes_df, followup_df, threshold) {
+  tryCatch(
+    {
+      if (nrow(followup_df) == 0L) {
+        stop("No follow-up records are available.")
+      }
+
+      followup_clean <- followup_df %>%
+        dplyr::mutate(
+          first_obs = to_date_safe(first_obs),
+          last_obs = to_date_safe(last_obs)
+        ) %>%
+        dplyr::filter(
+          !is.na(first_obs),
+          !is.na(last_obs),
+          last_obs > first_obs
+        )
+
+      if (nrow(followup_clean) == 0L) {
+        stop("No valid positive-length follow-up records are available.")
+      }
+
+      ag_intervals <- purrr::map_dfr(
+        seq_len(nrow(followup_clean)),
+        function(i) {
+          followup_row <- followup_clean[i, , drop = FALSE]
+          person_episodes <- episodes_df %>%
+            dplyr::filter(
+              pid == followup_row$pid[1],
+              hhid == followup_row$hhid[1]
+            )
+
+          build_one_person_ag_intervals(
+            followup_row,
+            person_episodes
+          )
+        }
+      ) %>%
+        dplyr::filter(
+          is.finite(tstart_num),
+          is.finite(tstop_num),
+          tstop_num > tstart_num
+        )
+
+      if (nrow(ag_intervals) == 0L) {
+        stop("No valid Andersen-Gill risk intervals were constructed.")
+      }
+
+      analysis_ag <- ag_intervals %>%
+        dplyr::left_join(
+          covariate_df,
+          by = c("pid", "hhid")
+        )
+
+      prepared <- prepare_cox_data(
+        analysis_ag,
+        final_covariates,
+        cluster_variable = "pid"
+      )
+
+      if (length(prepared$covariates) == 0L) {
+        stop("No final-model covariates are estimable in the AG data.")
+      }
+
+      formula_ag <- build_cox_formula(prepared$covariates)
+
+      fitted <- fit_cox_safely(
+        analysis_data = prepared$data,
+        formula = formula_ag,
+        cluster_variable = "pid",
+        threshold = threshold,
+        model_stub = "AG",
+        model_name = "Recurrent events"
+      )
+
+      list(
+        fit = fitted$fit,
+        data = prepared$data,
+        results = fitted$results
+      )
+    },
+    error = function(e) {
+      message(
+        "Ct ",
+        threshold,
+        ": Andersen-Gill model failed: ",
+        conditionMessage(e),
+        ". Continuing."
+      )
+
+      write_log(
+        paste0(
+          "Ct_",
+          ct_label(threshold),
+          "_AG_ERROR.txt"
+        ),
+        conditionMessage(e)
+      )
+
+      list(
+        fit = NULL,
+        data = tibble::tibble(),
+        results = empty_cox_results()
+      )
+    }
+  )
+}
+# ========================================================================
+# 17. HUMAN-READABLE HAZARD LABELS
+# ========================================================================
+
+pretty_hazard_label <- function(term) {
+  dplyr::case_when(
+    stringr::str_starts(term, "drinking_water_binary") ~
+      "Piped drinking water",
+    stringr::str_starts(term, "utensils_washed_binary") ~
+      "Utensils washed with piped water",
+    stringr::str_starts(term, "food_storage_binary") ~
+      "Food refrigerated",
+    stringr::str_starts(term, "ndir_leave_binary") ~
+      "Leaves Ndirande regularly",
+    stringr::str_starts(term, "meat_freq_binary") ~
+      "Meat frequency",
+    stringr::str_starts(term, "fish_freq_binary") ~
+      "Fish frequency",
+    term == "days_out_day" ~ "Days left house",
+    term == "cls_contactnum" ~ "Number of close contacts",
+    term == "eat_atcafe" ~ "Eats at cafe",
+    term == "water_treated" ~ "Household water treated",
+    term == "hand_index" ~ "Hand hygiene index",
+    term == "hours_in_house_num" ~ "Hours spent in house",
+    term == "age_yr" ~ "Age",
+    stringr::str_starts(term, "sex") ~ "Sex",
+    term == "wealth_index_z" ~ "Wealth index",
+    TRUE ~ stringr::str_replace_all(term, "_", " ")
+  )
+}
+
+# ========================================================================
+# 18. RUN ONE Ct THRESHOLD
+# ========================================================================
+
+run_one_threshold <- function(sensitivity_file, threshold) {
+  cat("\n\n============================================================\n")
+  cat("RUNNING Ct <= ", threshold, "\n", sep = "")
+  cat("============================================================\n")
+
+  # PCR status
+  pcr_df <- make_threshold_pcr(
+    sensitivity_file = sensitivity_file,
+    threshold = threshold
+  )
+
+  # Use the same follow-up denominator at every threshold.
+  followup_df <- followup_reference %>%
+    dplyr::filter(pid %in% unique(pcr_df$pid))
+
+  # Episodes
+  episodes_df <- build_episodes(pcr_df)
+
+  # Burden
+  burden <- calculate_burden(
+    pcr_df = pcr_df,
+    episodes_df = episodes_df,
+    followup_df = followup_df,
+    threshold = threshold
+  )
+
+  b <- burden$burden_summary
+
+  # Ct 37.1 QC: informational only; never stop.
+  if (abs(threshold - PRIMARY_CT) < 1e-8) {
+    qc <- tibble::tibble(
+      quantity = c(
+        "Positive stools",
+        "Positive participants",
+        "Episode rows",
+        "Observed-onset episodes",
+        "Completed episodes"
+      ),
+      expected = c(
+        PRIMARY_EXPECTED$n_positive_stools,
+        PRIMARY_EXPECTED$n_positive_participants,
+        PRIMARY_EXPECTED$n_episode_rows,
+        PRIMARY_EXPECTED$n_observed_onset,
+        PRIMARY_EXPECTED$n_completed
+      ),
+      observed = c(
+        b$n_positive_stools,
+        b$n_positive_participants,
+        b$n_episode_rows,
+        b$n_observed_onset,
+        b$n_completed_episodes
+      )
+    ) %>%
+      dplyr::mutate(
+        difference = observed - expected,
+        matches = observed == expected
+      )
+
+    cat("\nPRIMARY Ct=37.1 QC — INFORMATIONAL ONLY\n")
+    print(qc, n = Inf)
+
+    readr::write_csv(
+      qc,
+      file.path(
+        output_tables,
+        "primary_Ct37p1_episode_reconstruction_QC.csv"
+      )
+    )
+
+    message(
+      "Ct=37.1 mean duration = ",
+      round(b$mean_duration_days, 2),
+      " days; primary analysis approximately ",
+      PRIMARY_EXPECTED$mean_duration_days,
+      "."
+    )
+
+    message(
+      "Ct=37.1 median duration = ",
+      round(b$median_duration_days, 2),
+      " days; primary analysis ",
+      PRIMARY_EXPECTED$median_duration_days,
+      "."
+    )
+
+    message(
+      "Ct=37.1 incidence = ",
+      round(b$incidence_per_1000_person_days, 2),
+      " per 1000 person-days; primary analysis approximately ",
+      PRIMARY_EXPECTED$incidence_per_1000_pd,
+      "."
+    )
+
+    if (!all(qc$matches)) {
+      message(
+        "Some Ct=37.1 QC counts differ from the original analysis; ",
+        "all remaining thresholds will still run."
+      )
+    }
+  }
+
+  # Hazard models
+  first_fit <- fit_first_event_model(
+    episodes_df = episodes_df,
+    followup_df = followup_df,
+    threshold = threshold
+  )
+
+  ag_fit <- fit_ag_model(
+    episodes_df = episodes_df,
+    followup_df = followup_df,
+    threshold = threshold
+  )
+
+  # Save threshold-specific datasets.
+  label <- ct_label(threshold)
+
+  saveRDS(
+    pcr_df,
+    file.path(output_rds, paste0("Ct_", label, "_PCR_series.rds"))
+  )
+
+  saveRDS(
+    episodes_df,
+    file.path(output_rds, paste0("Ct_", label, "_episodes_df.rds"))
+  )
+
+  saveRDS(
+    burden$duration_episode_df,
+    file.path(
+      output_rds,
+      paste0("Ct_", label, "_completed_episode_durations.rds")
+    )
+  )
+
+  saveRDS(
+    burden$person_time_df,
+    file.path(output_rds, paste0("Ct_", label, "_person_time_df.rds"))
+  )
+
+  saveRDS(
+    burden$boot_results,
+    file.path(output_rds, paste0("Ct_", label, "_bootstrap_results.rds"))
+  )
+
+  saveRDS(
+    first_fit$data,
+    file.path(output_rds, paste0("Ct_", label, "_first_event_model_data.rds"))
+  )
+
+  saveRDS(
+    ag_fit$data,
+    file.path(output_rds, paste0("Ct_", label, "_AG_model_data.rds"))
+  )
+
+  cat("\nBURDEN / DURATION SUMMARY\n")
+
+  print(
+    b %>%
+      dplyr::select(
+        threshold,
+        n_positive_stools,
+        percent_stools_positive,
+        n_positive_participants,
+        n_positive_households,
+        n_episode_rows,
+        n_observed_onset,
+        n_completed_episodes,
+        mean_duration_days,
+        median_duration_days,
+        incidence_per_1000_person_days,
+        person_time_prevalence_percent
+      ),
+    width = Inf
+  )
+
+  list(
+    threshold = threshold,
+    burden = b,
+    first_hr = first_fit$results,
+    recurrent_hr = ag_fit$results,
+    episodes = episodes_df
+  )
+}
+
+# ========================================================================
+# 19. RUN ALL THRESHOLDS
+# ========================================================================
+
+all_sensitivity_results <- purrr::map2(
+  scenario_manifest$sensitivity_file,
+  scenario_manifest$threshold,
+  function(sensitivity_file, threshold) {
+    tryCatch(
+      run_one_threshold(
+        sensitivity_file = sensitivity_file,
+        threshold = threshold
+      ),
+      error = function(e) {
+        message(
+          "Ct ",
+          threshold,
+          " scenario-level error: ",
+          conditionMessage(e),
+          ". Continuing to next threshold."
+        )
+
+        write_log(
+          paste0(
+            "Ct_",
+            ct_label(threshold),
+            "_SCENARIO_ERROR.txt"
+          ),
+          conditionMessage(e)
+        )
+
+        list(
+          threshold = threshold,
+          burden = tibble::tibble(threshold = threshold),
+          first_hr = empty_cox_results(),
+          recurrent_hr = empty_cox_results(),
+          episodes = empty_episode_table()
+        )
+      }
+    )
+  }
+)
+
+n_successful_scenarios <- sum(
+  purrr::map_lgl(
+    all_sensitivity_results,
+    function(x) ncol(x$burden) > 1L
+  )
+)
+
+if (n_successful_scenarios == 0L) {
+  stop(
+    "No Ct-threshold scenario completed successfully. Inspect the files in: ",
+    output_logs,
+    call. = FALSE
+  )
+}
+
+# ========================================================================
+# 20. COMBINE BURDEN RESULTS
+# ========================================================================
+
+burden_summary_all <- purrr::map_dfr(
+  all_sensitivity_results,
+  "burden"
+) %>%
+  dplyr::arrange(threshold)
+
+readr::write_csv(
+  burden_summary_all,
+  file.path(
+    output_tables,
+    "Ct_threshold_burden_duration_summary_FULL.csv"
+  )
+)
+
+# ========================================================================
+# 21. COMBINE HAZARD RESULTS
+# ========================================================================
+
+first_hr_all <- purrr::map_dfr(all_sensitivity_results, "first_hr")
+ag_hr_all <- purrr::map_dfr(all_sensitivity_results, "recurrent_hr")
+hazards_all <- dplyr::bind_rows(first_hr_all, ag_hr_all)
+
+if (nrow(hazards_all) > 0L) {
+  hazards_all <- hazards_all %>%
+    dplyr::mutate(label = pretty_hazard_label(term)) %>%
+    dplyr::arrange(model, label, threshold)
+}
+
+readr::write_csv(
+  first_hr_all,
+  file.path(output_tables, "Ct_threshold_first_event_HRs.csv")
+)
+
+readr::write_csv(
+  ag_hr_all,
+  file.path(output_tables, "Ct_threshold_recurrent_AG_HRs.csv")
+)
+
+readr::write_csv(
+  hazards_all,
+  file.path(output_tables, "Ct_threshold_ALL_hazard_results.csv")
+)
+
+# ========================================================================
+# 22. BURDEN / DURATION — AT A GLANCE
+# ========================================================================
+
+required_burden_output_columns <- c(
+  "threshold",
+  "n_positive_stools",
+  "percent_stools_positive",
+  "n_positive_participants",
+  "n_episode_rows",
+  "n_observed_onset",
+  "n_completed_episodes",
+  "mean_duration_days",
+  "median_duration_days",
+  "q1_duration_days",
+  "q3_duration_days",
+  "incidence_per_1000_person_days",
+  "person_time_prevalence_percent"
+)
+
+if (all(required_burden_output_columns %in% names(burden_summary_all))) {
+  burden_at_glance <- burden_summary_all %>%
+    dplyr::transmute(
+      `Ct threshold` = threshold,
+      `PCR-positive stools` = n_positive_stools,
+      `Stools positive (%)` = round(percent_stools_positive, 2),
+      `Positive participants` = n_positive_participants,
+      `Possible episodes` = n_episode_rows,
+      `Observed-onset episodes` = n_observed_onset,
+      `Completed episodes` = n_completed_episodes,
+      `Mean duration (days)` = round(mean_duration_days, 2),
+      `Median duration (days)` = round(median_duration_days, 2),
+      `Duration IQR` = format_range(
+        q1_duration_days,
+        q3_duration_days,
+        digits = 1L
+      ),
+      `Incidence /1000 person-days` = round(
+        incidence_per_1000_person_days,
+        2
+      ),
+      `Person-time prevalence (%)` = round(
+        person_time_prevalence_percent,
+        2
+      )
+    )
+
+  readr::write_csv(
+    burden_at_glance,
+    file.path(output_tables, "Ct_threshold_BURDEN_AT_A_GLANCE.csv")
+  )
+
+  cat("\n\n============================================================\n")
+  cat("BURDEN / DURATION — AT A GLANCE\n")
+  cat("============================================================\n")
+  print(burden_at_glance, n = Inf, width = Inf)
+} else {
+  burden_at_glance <- tibble::tibble()
+}
+# ========================================================================
+# 23. HAZARD STABILITY SUMMARY
+# ========================================================================
+
+primary_group_value <- function(values, thresholds) {
+  primary_index <- which(abs(thresholds - PRIMARY_CT) < 1e-8)
+
+  if (length(primary_index) == 0L) {
+    return(NA_real_)
+  }
+
+  as.numeric(values[primary_index[1]])
+}
+
+direction_is_consistent <- function(hr_values, primary_hr) {
+  finite_hr <- hr_values[is.finite(hr_values)]
+
+  if (!is.finite(primary_hr) || length(finite_hr) == 0L) {
+    return(NA)
+  }
+
+  if (primary_hr > 1) {
+    return(all(finite_hr > 1))
+  }
+
+  if (primary_hr < 1) {
+    return(all(finite_hr < 1))
+  }
+
+  NA
+}
+
+if (nrow(hazards_all) > 0L) {
+  hazard_stability_summary <- hazards_all %>%
+    dplyr::group_by(model, term, label) %>%
+    dplyr::summarise(
+      HR_primary = primary_group_value(HR, threshold),
+      p_primary = primary_group_value(p, threshold),
+      HR_min = if (any(is.finite(HR))) {
+        min(HR, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      HR_max = if (any(is.finite(HR))) {
+        max(HR, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      n_thresholds = sum(is.finite(HR)),
+      n_significant = sum(is.finite(p) & p < 0.05),
+      direction_consistent = direction_is_consistent(
+        HR,
+        primary_group_value(HR, threshold)
+      ),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(model, label)
+
+} else {
+  hazard_stability_summary <- tibble::tibble(
+    model = character(),
+    term = character(),
+    label = character(),
+    HR_primary = numeric(),
+    p_primary = numeric(),
+    HR_min = numeric(),
+    HR_max = numeric(),
+    n_thresholds = integer(),
+    n_significant = integer(),
+    direction_consistent = logical()
+  )
+}
+
+readr::write_csv(
+  hazard_stability_summary,
+  file.path(
+    output_tables,
+    "Ct_threshold_HAZARD_STABILITY_SUMMARY.csv"
+  )
+)
+
+# ========================================================================
+# 23B. ALL FIXED FINAL HAZARDS — AT A GLANCE
+# ========================================================================
+# Unlike the concise key-hazard table, this table contains every coefficient
+# from the fixed final first-event and recurrent-event models, including the
+# composite hand-hygiene index and all other retained/pre-specified terms.
+
+if (nrow(hazards_all) > 0L) {
+  all_hazards_long <- hazards_all %>%
+    dplyr::filter(
+      is.finite(HR),
+      is.finite(lo),
+      is.finite(hi)
+    ) %>%
+    dplyr::mutate(
+      p_text = format_p_value(p),
+      result = dplyr::if_else(
+        is.na(p_text),
+        sprintf("%.2f (%.2f–%.2f), p=NA", HR, lo, hi),
+        sprintf("%.2f (%.2f–%.2f), p=%s", HR, lo, hi, p_text)
+      ),
+      column_name = paste(model, label, sep = " — ")
+    ) %>%
+    dplyr::select(threshold, column_name, result) %>%
+    dplyr::distinct()
+
+  all_hazards_at_glance <- if (nrow(all_hazards_long) > 0L) {
+    all_hazards_long %>%
+      tidyr::pivot_wider(
+        names_from = column_name,
+        values_from = result,
+        values_fn = dplyr::first
+      ) %>%
+      dplyr::arrange(threshold)
+  } else {
+    tibble::tibble(threshold = numeric())
+  }
+} else {
+  all_hazards_at_glance <- tibble::tibble(threshold = numeric())
+}
+
+readr::write_csv(
+  all_hazards_at_glance,
+  file.path(
+    output_tables,
+    "Ct_threshold_ALL_FINAL_HAZARDS_AT_A_GLANCE.csv"
+  )
+)
+
+# ========================================================================
+# 24. KEY HAZARDS — AT A GLANCE
+# ========================================================================
+
+key_hazard_labels <- c(
+  "Days left house",
+  "Number of close contacts",
+  "Eats at cafe",
+  "Utensils washed with piped water",
+  "Hand hygiene index"
+)
+
+if (nrow(hazards_all) > 0L) {
+  key_hazards_long <- hazards_all %>%
+    dplyr::filter(
+      label %in% key_hazard_labels,
+      is.finite(HR),
+      is.finite(lo),
+      is.finite(hi)
+    ) %>%
+    dplyr::mutate(
+      p_text = format_p_value(p),
+      result = dplyr::if_else(
+        is.na(p_text),
+        sprintf("%.2f (%.2f–%.2f), p=NA", HR, lo, hi),
+        sprintf("%.2f (%.2f–%.2f), p=%s", HR, lo, hi, p_text)
+      ),
+      column_name = paste(model, label, sep = " — ")
+    ) %>%
+    dplyr::select(threshold, column_name, result) %>%
+    dplyr::distinct()
+
+  if (nrow(key_hazards_long) > 0L) {
+    key_hazards <- key_hazards_long %>%
+      tidyr::pivot_wider(
+        names_from = column_name,
+        values_from = result,
+        values_fn = dplyr::first
+      ) %>%
+      dplyr::arrange(threshold)
+
+
+    cat("\n\n============================================================\n")
+    cat("KEY HAZARDS — AT A GLANCE\n")
+    cat("============================================================\n")
+    print(key_hazards, n = Inf, width = Inf)
+  } else {
+    key_hazards <- tibble::tibble(threshold = numeric())
+  }
+} else {
+  key_hazards <- tibble::tibble(threshold = numeric())
+}
+
+readr::write_csv(
+  key_hazards,
+  file.path(
+    output_tables,
+    "Ct_threshold_KEY_HAZARDS_AT_A_GLANCE.csv"
+  )
+)
+
+# ========================================================================
+# 25. MASTER AT-A-GLANCE TABLE
+# ========================================================================
+
+if (nrow(burden_at_glance) > 0L) {
+  master_at_glance <- burden_at_glance %>%
+    dplyr::rename(threshold = `Ct threshold`)
+
+  if (exists("all_hazards_at_glance") && nrow(all_hazards_at_glance) > 0L) {
+    master_at_glance <- master_at_glance %>%
+      dplyr::left_join(all_hazards_at_glance, by = "threshold")
+  } else if (nrow(key_hazards) > 0L) {
+    master_at_glance <- master_at_glance %>%
+      dplyr::left_join(key_hazards, by = "threshold")
+  }
+
+  master_at_glance <- master_at_glance %>%
+    dplyr::rename(`Ct threshold` = threshold)
+
+  readr::write_csv(
+    master_at_glance,
+    file.path(output_tables, "Ct_threshold_MASTER_AT_A_GLANCE.csv")
+  )
+
+  cat("\n\n============================================================\n")
+  cat("MASTER Ct SENSITIVITY SUMMARY\n")
+  cat("============================================================\n")
+  print(master_at_glance, n = Inf, width = Inf)
+} else {
+  master_at_glance <- tibble::tibble()
+}
+
+# ========================================================================
+# 26. CHANGE FROM PRIMARY Ct=37.1
+# ========================================================================
+
+if (
+  nrow(burden_summary_all) > 0L &&
+    all(
+      c(
+        "threshold",
+        "n_positive_stools",
+        "n_completed_episodes",
+        "mean_duration_days",
+        "median_duration_days",
+        "incidence_per_1000_person_days"
+      ) %in% names(burden_summary_all)
+    ) &&
+    any(abs(burden_summary_all$threshold - PRIMARY_CT) < 1e-8)
+) {
+  primary_burden <- burden_summary_all %>%
+    dplyr::filter(abs(threshold - PRIMARY_CT) < 1e-8) %>%
+    dplyr::slice(1)
+
+  burden_change_from_primary <- burden_summary_all %>%
+    dplyr::mutate(
+      change_positive_stools_pct = relative_change_percent(
+        n_positive_stools,
+        primary_burden$n_positive_stools
+      ),
+      change_completed_episodes_pct = relative_change_percent(
+        n_completed_episodes,
+        primary_burden$n_completed_episodes
+      ),
+      change_mean_duration_pct = relative_change_percent(
+        mean_duration_days,
+        primary_burden$mean_duration_days
+      ),
+      change_median_duration_pct = relative_change_percent(
+        median_duration_days,
+        primary_burden$median_duration_days
+      ),
+      change_incidence_pct = relative_change_percent(
+        incidence_per_1000_person_days,
+        primary_burden$incidence_per_1000_person_days
+      )
+    ) %>%
+    dplyr::select(
+      threshold,
+      change_positive_stools_pct,
+      change_completed_episodes_pct,
+      change_mean_duration_pct,
+      change_median_duration_pct,
+      change_incidence_pct
+    )
+
+  readr::write_csv(
+    burden_change_from_primary,
+    file.path(
+      output_tables,
+      "Ct_threshold_CHANGE_FROM_PRIMARY_37p1.csv"
+    )
+  )
+}
+
+# ========================================================================
+# ========================================================================
+# 30. SAVE SCENARIO MANIFEST
+# ========================================================================
+
+readr::write_csv(
+  scenario_manifest,
+  file.path(
+    output_tables,
+    "Ct_threshold_sensitivity_input_manifest.csv"
+  )
+)
+
+# ========================================================================
+# 31. FINAL MESSAGE
+# ========================================================================
+
+cat("\n\n============================================================\n")
+cat("Ct THRESHOLD SENSITIVITY ANALYSIS COMPLETE\n")
+cat("============================================================\n\n")
+cat("OPEN FIRST:\n\n")
+cat(
+  file.path(output_tables, "Ct_threshold_MASTER_AT_A_GLANCE.csv"),
+  "\n\n"
+)
+cat("Other key outputs:\n\n")
+cat(
+  file.path(output_tables, "Ct_threshold_BURDEN_AT_A_GLANCE.csv"),
+  "\n"
+)
+cat(
+  file.path(output_tables, "Ct_threshold_KEY_HAZARDS_AT_A_GLANCE.csv"),
+  "\n"
+)
+cat(
+  file.path(output_tables, "Ct_threshold_HAZARD_STABILITY_SUMMARY.csv"),
+  "\n"
+)
+cat(
+  file.path(
+    output_tables,
+    "primary_Ct37p1_episode_reconstruction_QC.csv"
+  ),
+  "\n"
+)
+cat(
+  file.path(
+    output_tables,
+    "Ct_threshold_CHANGE_FROM_PRIMARY_37p1.csv"
+  ),
+  "\n\n"
+)
+cat("Interpretation questions:\n")
+cat("1. Does median episode duration remain approximately 2 days?\n")
+cat("2. How much does mean duration change across Ct definitions?\n")
+cat("3. How much do incidence and prevalence depend on the threshold?\n")
+cat("4. Do the principal hazard ratios retain their direction and magnitude?\n")
+cat("5. What happens when moving from Ct 37.1 to Ct 35 and Ct 30?\n")
+cat("6. What happens when moving in the permissive direction to Ct 38–40?\n\n")
+```

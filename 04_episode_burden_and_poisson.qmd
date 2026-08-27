@@ -1,0 +1,1208 @@
+---
+title: "TiNTS epidemiological analysis: episode burden and recurrence sensitivity"
+format: html
+execute:
+  echo: true
+  warning: true
+  message: true
+editor: source
+---
+
+This document reproduces the primary episode-based incidence, prevalence, and duration estimates, including household-clustered bootstrap confidence intervals, followed by the Poisson sensitivity analysis of recurrent episodes.
+
+## Episode burden
+
+```{r}
+# ============================================================
+# TiNTS manuscript eNTS burden analysis:
+# incidence, duration, prevalence, and person-time at risk
+# ============================================================
+#
+# Implements the manuscript episode-based methods:
+#   1. eNTS episodes are already defined in episodes_df:
+#        - episode starts after >=2 negatives followed by >=1 positive
+#        - episode ends after >=2 negatives following positivity
+#
+#   2. Time at risk:
+#        - participants are at risk from first to last PCR observation
+#        - subtract all time when they cannot be considered at risk:
+#            a) left-censored PCR-positive periods
+#            b) completed eNTS episode periods
+#            c) right-censored terminal PCR-positive periods
+#        - for completed episodes, re-entry to risk occurs at end_upper
+#          i.e. when the episode can be said to have ended by definition
+#
+#   3. Duration and prevalence:
+#        - calculated only for episodes with observed onset and observed offset
+#        - onset = 24 h before first PCR-positive sample in episode
+#        - offset = 24 h after final PCR-positive sample in episode
+#
+#   4. Incidence:
+#        - primary estimate uses only episodes with observed onset AND offset
+#          because right-censored terminal episodes are excluded from incidence/prevalence
+#
+#   5. Confidence intervals:
+#        - household-clustered bootstrap
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(here)
+
+# ------------------------------------------------------------
+# 0. Settings
+# ------------------------------------------------------------
+
+set.seed(1)
+n_boot <- 2000
+padding_days <- 1
+
+# Primary analysis setting:
+# FALSE = incidence uses only episodes with observed onset AND observed offset.
+# TRUE  = sensitivity: incidence uses all observed-onset episodes, including right-censored terminal events.
+include_right_censored_in_incidence <- FALSE
+
+# ------------------------------------------------------------
+# 1. Helper functions
+# ------------------------------------------------------------
+
+to_date_safe <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXt")) return(as.Date(x))
+
+  x_chr <- trimws(as.character(x))
+  x_chr[x_chr %in% c("", "NA", "N/A", "NULL", ".")] <- NA_character_
+
+  out <- as.Date(rep(NA_character_, length(x_chr)))
+
+  # TiNTS/Stata-style dates, e.g. 01jan2024 or 01JAN2024
+  idx <- !is.na(x_chr) & grepl("^\\d{1,2}[A-Za-z]{3}\\d{4}$", x_chr)
+  if (any(idx)) {
+    out[idx] <- as.Date(
+      tolower(x_chr[idx]),
+      format = "%d%b%Y"
+    )
+  }
+
+  # ISO dates, e.g. 2024-01-01
+  idx <- is.na(out) & !is.na(x_chr) &
+    grepl("^\\d{4}-\\d{1,2}-\\d{1,2}$", x_chr)
+  if (any(idx)) {
+    out[idx] <- as.Date(
+      x_chr[idx],
+      format = "%Y-%m-%d"
+    )
+  }
+
+  # UK numeric dates, e.g. 01/01/2024 or 01-01-2024
+  idx <- is.na(out) & !is.na(x_chr) &
+    grepl("^\\d{1,2}[/-]\\d{1,2}[/-]\\d{4}$", x_chr)
+  if (any(idx) && requireNamespace("lubridate", quietly = TRUE)) {
+    out[idx] <- as.Date(
+      suppressWarnings(lubridate::dmy(x_chr[idx], quiet = TRUE))
+    )
+  }
+
+  # Final fallback for any remaining common date representations
+  idx <- is.na(out) & !is.na(x_chr)
+  if (any(idx) && requireNamespace("lubridate", quietly = TRUE)) {
+    parsed <- suppressWarnings(
+      lubridate::parse_date_time(
+        x_chr[idx],
+        orders = c(
+          "dmy", "ymd",
+          "d b Y", "d B Y",
+          "Y-m-d", "d/m/Y", "d-m-Y"
+        ),
+        quiet = TRUE
+      )
+    )
+    out[idx] <- as.Date(parsed)
+  }
+
+  out
+}
+
+safe_divide <- function(num, den) {
+  ifelse(is.finite(den) & den > 0, num / den, NA_real_)
+}
+
+interval_union_days <- function(start, stop) {
+  x <- tibble(
+    start = as.numeric(start),
+    stop  = as.numeric(stop)
+  ) %>%
+    filter(
+      is.finite(start),
+      is.finite(stop),
+      stop > start
+    ) %>%
+    arrange(start, stop)
+
+  if (nrow(x) == 0) return(0)
+
+  current_start <- x$start[1]
+  current_stop  <- x$stop[1]
+  total <- 0
+
+  if (nrow(x) > 1) {
+    for (i in 2:nrow(x)) {
+      if (x$start[i] <= current_stop) {
+        current_stop <- max(current_stop, x$stop[i])
+      } else {
+        total <- total + (current_stop - current_start)
+        current_start <- x$start[i]
+        current_stop  <- x$stop[i]
+      }
+    }
+  }
+
+  total + (current_stop - current_start)
+}
+
+format_est <- function(x, digits = 2) {
+  ifelse(
+    is.na(x),
+    "—",
+    formatC(x, format = "f", digits = digits)
+  )
+}
+
+q_safe <- function(x, prob) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  as.numeric(quantile(x, prob, na.rm = TRUE))
+}
+
+# ------------------------------------------------------------
+# 2. Load required objects if not already in environment
+# ------------------------------------------------------------
+
+if (!exists("episodes_df")) {
+  episodes_df <- readr::read_rds(here::here("rds", "episodes_df.rds"))
+}
+
+if (!exists("followup_df")) {
+  followup_df <- readr::read_rds(here::here("rds", "followup_df.rds"))
+}
+
+# Need PCR-level data to identify the final positive sample in each episode.
+if (exists("pcr_long")) {
+  pcr_data <- pcr_long
+} else if (exists("CRF_PCR")) {
+  pcr_data <- CRF_PCR
+} else {
+  pcr_data <- readr::read_csv(
+    here::here("data_clean", "bayesian_pcr_for_epi_analysis_28052025.csv"),
+    show_col_types = FALSE
+  )
+}
+
+# ------------------------------------------------------------
+# 3. Prepare follow-up denominator
+# ------------------------------------------------------------
+
+followup_chapter <- followup_df %>%
+  mutate(
+    first_obs = to_date_safe(first_obs),
+    last_obs  = to_date_safe(last_obs),
+    first_obs_num = as.numeric(first_obs),
+    last_obs_num  = as.numeric(last_obs),
+    followup_days = as.numeric(last_obs - first_obs)
+  ) %>%
+  select(pid, hhid, first_obs, last_obs, first_obs_num, last_obs_num, followup_days) %>%
+  distinct(pid, .keep_all = TRUE) %>%
+  filter(
+    !is.na(pid),
+    !is.na(hhid),
+    !is.na(first_obs),
+    !is.na(last_obs),
+    is.finite(followup_days),
+    followup_days > 0
+  )
+
+# ------------------------------------------------------------
+# 4. Prepare PCR data
+# ------------------------------------------------------------
+
+pcr_data <- pcr_data %>%
+  mutate(
+    data_date = to_date_safe(data_date)
+  )
+
+if ("pcr_pos" %in% names(pcr_data)) {
+  pcr_data <- pcr_data %>%
+    mutate(pcr_pos = as.integer(pcr_pos))
+} else {
+  if (!"CT_Value" %in% names(pcr_data)) {
+    stop("PCR data must contain either pcr_pos or CT_Value.")
+  }
+
+  pcr_data <- pcr_data %>%
+    mutate(
+      pcr_pos = case_when(
+        is.na(CT_Value) ~ NA_integer_,
+        as.character(CT_Value) == "PCR negative" ~ 0L,
+        TRUE ~ 1L
+      )
+    )
+}
+
+pcr_data <- pcr_data %>%
+  filter(
+    !is.na(pid),
+    !is.na(data_date),
+    !is.na(pcr_pos)
+  ) %>%
+  select(pid, data_date, pcr_pos)
+
+# ------------------------------------------------------------
+# 5. Prepare episode table and derive final positive date
+# ------------------------------------------------------------
+
+required_episode_cols <- c("pid", "hhid", "onset_lower", "onset_upper", "end_upper")
+missing_episode_cols <- setdiff(required_episode_cols, names(episodes_df))
+
+if (length(missing_episode_cols) > 0) {
+  stop(
+    "episodes_df is missing required columns: ",
+    paste(missing_episode_cols, collapse = ", ")
+  )
+}
+
+episodes_base <- episodes_df %>%
+  mutate(
+    onset_lower = to_date_safe(onset_lower),
+    onset_upper = to_date_safe(onset_upper),
+    end_upper   = to_date_safe(end_upper)
+  ) %>%
+  left_join(
+    followup_chapter %>%
+      select(pid, first_obs, last_obs, first_obs_num, last_obs_num),
+    by = "pid"
+  ) %>%
+  mutate(
+    episode_row_id = row_number(),
+    observed_onset = !is.na(onset_lower) & !is.na(onset_upper),
+    observed_offset = !is.na(end_upper),
+    closed_episode = observed_onset & observed_offset
+  )
+
+# Derive final PCR-positive sample date within each episode.
+# If end_upper is present, final positive must occur before end_upper.
+# If end_upper is absent, final positive is derived up to last follow-up.
+derived_last_positive <- episodes_base %>%
+  select(episode_row_id, pid, onset_upper, end_upper, last_obs) %>%
+  left_join(pcr_data, by = "pid") %>%
+  filter(
+    pcr_pos == 1L,
+    !is.na(onset_upper),
+    data_date >= onset_upper,
+    case_when(
+      !is.na(end_upper) ~ data_date < end_upper,
+      is.na(end_upper) & !is.na(last_obs) ~ data_date <= last_obs,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  group_by(episode_row_id) %>%
+  summarise(
+    last_positive = max(data_date, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+episodes_base <- episodes_base %>%
+  left_join(derived_last_positive, by = "episode_row_id") %>%
+  mutate(
+    # Fallback: if no PCR row is matched, use onset_upper.
+    last_positive = coalesce(last_positive, onset_upper)
+  )
+
+# ------------------------------------------------------------
+# 6. Construct all non-at-risk episode windows
+# ------------------------------------------------------------
+#
+# For time-at-risk:
+#   - if onset observed: not-at-risk starts 24 h before first positive
+#   - if onset not observed: not-at-risk starts at first observation
+#   - if offset observed: participant re-enters risk set at end_upper
+#   - if offset not observed: not-at-risk continues to last observation
+#
+# This removes:
+#   - completed episodes
+#   - left-censored positive periods
+#   - right-censored terminal positive periods
+
+not_at_risk_windows <- episodes_base %>%
+  mutate(
+    nonrisk_start_num = case_when(
+      observed_onset ~ pmax(as.numeric(onset_upper) - padding_days, first_obs_num, na.rm = TRUE),
+      !observed_onset ~ first_obs_num,
+      TRUE ~ NA_real_
+    ),
+    nonrisk_stop_num = case_when(
+      observed_offset ~ pmin(as.numeric(end_upper), last_obs_num, na.rm = TRUE),
+      !observed_offset ~ last_obs_num,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    !is.na(pid),
+    !is.na(hhid),
+    is.finite(nonrisk_start_num),
+    is.finite(nonrisk_stop_num),
+    nonrisk_stop_num > nonrisk_start_num
+  ) %>%
+  select(
+    pid, hhid, episode_row_id, observed_onset, observed_offset, closed_episode,
+    nonrisk_start_num, nonrisk_stop_num
+  )
+
+not_at_risk_by_pid <- not_at_risk_windows %>%
+  group_by(pid, hhid) %>%
+  summarise(
+    not_at_risk_days = interval_union_days(nonrisk_start_num, nonrisk_stop_num),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 7. Construct completed-episode duration windows
+# ------------------------------------------------------------
+#
+# Duration/prevalence are based only on episodes with observed onset and offset.
+# Duration window:
+#   onset  = first positive - 1 day
+#   offset = final positive + 1 day
+#
+# This is deliberately not the same as end_upper, because end_upper is the
+# clearance-confirmation boundary used for re-entry into the risk set.
+
+episode_duration_chapter <- episodes_base %>%
+  filter(closed_episode) %>%
+  mutate(
+    duration_start_num = pmax(
+      as.numeric(onset_upper) - padding_days,
+      first_obs_num,
+      na.rm = TRUE
+    ),
+    duration_stop_num = pmin(
+      as.numeric(last_positive) + padding_days,
+      last_obs_num,
+      as.numeric(end_upper),
+      na.rm = TRUE
+    ),
+    duration_days = duration_stop_num - duration_start_num,
+    duration_start = as.Date(duration_start_num, origin = "1970-01-01"),
+    duration_stop  = as.Date(duration_stop_num,  origin = "1970-01-01")
+  ) %>%
+  filter(
+    is.finite(duration_start_num),
+    is.finite(duration_stop_num),
+    duration_stop_num > duration_start_num
+  ) %>%
+  select(
+    pid, hhid, episode_row_id,
+    episode_id, episode_order, singleton, n_pos,
+    onset_lower, onset_upper, last_positive, end_upper,
+    duration_start, duration_stop,
+    duration_start_num, duration_stop_num,
+    duration_days
+  )
+
+closed_episode_days_by_pid <- episode_duration_chapter %>%
+  group_by(pid, hhid) %>%
+  summarise(
+    closed_episode_days = interval_union_days(duration_start_num, duration_stop_num),
+    .groups = "drop"
+  )
+
+closed_episodes_by_pid <- episode_duration_chapter %>%
+  count(pid, hhid, name = "n_closed_episodes")
+
+# ------------------------------------------------------------
+# 8. Select incidence numerator
+# ------------------------------------------------------------
+
+if (include_right_censored_in_incidence) {
+  episode_incidence_chapter <- episodes_base %>%
+    filter(observed_onset) %>%
+    select(pid, hhid, episode_row_id, episode_id, episode_order, observed_offset)
+} else {
+  episode_incidence_chapter <- episode_duration_chapter %>%
+    select(pid, hhid, episode_row_id, episode_id, episode_order) %>%
+    mutate(observed_offset = TRUE)
+}
+
+incidence_episodes_by_pid <- episode_incidence_chapter %>%
+  count(pid, hhid, name = "n_incidence_episodes")
+
+# ------------------------------------------------------------
+# 9. Person-level burden dataset
+# ------------------------------------------------------------
+#
+# Incidence denominator:
+#   total at-risk time = follow-up - all non-at-risk episode windows.
+#
+# Prevalence denominator:
+#   time that is classifiable as either:
+#      a) at risk, or
+#      b) inside a completed eNTS episode duration window.
+#
+# This avoids including left-censored or right-censored positive time
+# in the prevalence denominator.
+
+person_time_chapter <- followup_chapter %>%
+  left_join(not_at_risk_by_pid, by = c("pid", "hhid")) %>%
+  left_join(closed_episode_days_by_pid, by = c("pid", "hhid")) %>%
+  left_join(closed_episodes_by_pid, by = c("pid", "hhid")) %>%
+  left_join(incidence_episodes_by_pid, by = c("pid", "hhid")) %>%
+  mutate(
+    not_at_risk_days = replace_na(not_at_risk_days, 0),
+    closed_episode_days = replace_na(closed_episode_days, 0),
+    n_closed_episodes = replace_na(n_closed_episodes, 0L),
+    n_incidence_episodes = replace_na(n_incidence_episodes, 0L),
+
+    at_risk_days = pmax(followup_days - not_at_risk_days, 0),
+
+    # Denominator for person-time prevalence of completed/evaluable episodes.
+    prevalence_denominator_days = at_risk_days + closed_episode_days
+  )
+
+# ------------------------------------------------------------
+# 10. Audit counts
+# ------------------------------------------------------------
+
+chapter_episode_audit <- episodes_base %>%
+  summarise(
+    total_episode_rows = n(),
+    observed_onset_episodes = sum(observed_onset, na.rm = TRUE),
+    closed_onset_and_offset_episodes = sum(closed_episode, na.rm = TRUE),
+    observed_onset_right_censored_episodes = sum(observed_onset & !observed_offset, na.rm = TRUE),
+    left_censored_or_unbounded_onset_rows = sum(!observed_onset, na.rm = TRUE),
+    participants_with_any_episode_row = n_distinct(pid),
+    participants_with_observed_onset_episode = n_distinct(pid[observed_onset]),
+    participants_with_closed_episode = n_distinct(pid[closed_episode])
+  )
+
+cat("\n==============================\n")
+cat("EPISODE AUDIT\n")
+cat("==============================\n")
+print(chapter_episode_audit, width = Inf)
+
+# ------------------------------------------------------------
+# 11. Summary function
+# ------------------------------------------------------------
+
+summarise_chapter_burden <- function(person_df, duration_episode_df, incidence_episode_df) {
+
+  duration_values <- duration_episode_df$duration_days
+
+  total_incidence_events <- nrow(incidence_episode_df)
+  total_duration_episodes <- nrow(duration_episode_df)
+
+  total_followup_days <- sum(person_df$followup_days, na.rm = TRUE)
+  total_not_at_risk_days <- sum(person_df$not_at_risk_days, na.rm = TRUE)
+  total_at_risk_days <- sum(person_df$at_risk_days, na.rm = TRUE)
+  total_closed_episode_days <- sum(person_df$closed_episode_days, na.rm = TRUE)
+  total_prevalence_denominator_days <- sum(person_df$prevalence_denominator_days, na.rm = TRUE)
+
+  tibble(
+    n_participants = n_distinct(person_df$pid),
+    n_households = n_distinct(person_df$hhid),
+
+    n_incidence_events = total_incidence_events,
+    n_duration_prevalence_episodes = total_duration_episodes,
+
+    n_participants_with_incidence_events = n_distinct(incidence_episode_df$pid),
+    n_participants_with_duration_prevalence_episodes = n_distinct(duration_episode_df$pid),
+
+    total_followup_days = total_followup_days,
+    total_not_at_risk_days = total_not_at_risk_days,
+    total_at_risk_days = total_at_risk_days,
+    total_closed_episode_days = total_closed_episode_days,
+    total_prevalence_denominator_days = total_prevalence_denominator_days,
+
+    mean_duration_days = mean(duration_values, na.rm = TRUE),
+    median_duration_days = median(duration_values, na.rm = TRUE),
+    q1_duration_days = q_safe(duration_values, 0.25),
+    q3_duration_days = q_safe(duration_values, 0.75),
+    min_duration_days = min(duration_values, na.rm = TRUE),
+    max_duration_days = max(duration_values, na.rm = TRUE),
+
+    incidence_per_1000_person_days =
+      safe_divide(total_incidence_events, total_at_risk_days) * 1000,
+
+    incidence_per_100_person_years =
+      safe_divide(total_incidence_events, total_at_risk_days / 365.25) * 100,
+
+    incidence_per_100_participants_28_days =
+      safe_divide(total_incidence_events, total_at_risk_days) * 28 * 100,
+
+    person_time_prevalence_percent =
+      safe_divide(total_closed_episode_days, total_prevalence_denominator_days) * 100
+  )
+}
+
+burden_estimates_chapter <- summarise_chapter_burden(
+  person_df = person_time_chapter,
+  duration_episode_df = episode_duration_chapter,
+  incidence_episode_df = episode_incidence_chapter
+)
+
+cat("\n==============================\n")
+cat("MAIN BURDEN ESTIMATES\n")
+cat("==============================\n")
+print(burden_estimates_chapter, width = Inf)
+
+# ------------------------------------------------------------
+# 12. Household-clustered bootstrap confidence intervals
+# ------------------------------------------------------------
+
+cluster_ids <- unique(person_time_chapter$hhid)
+
+bootstrap_once_chapter <- function(i) {
+
+  sampled_clusters <- sample(
+    cluster_ids,
+    length(cluster_ids),
+    replace = TRUE
+  )
+
+  person_boot <- map_dfr(seq_along(sampled_clusters), function(j) {
+    person_time_chapter %>%
+      filter(hhid == sampled_clusters[j]) %>%
+      mutate(bootstrap_cluster_id = j)
+  })
+
+  duration_episode_boot <- map_dfr(seq_along(sampled_clusters), function(j) {
+    episode_duration_chapter %>%
+      filter(hhid == sampled_clusters[j]) %>%
+      mutate(bootstrap_cluster_id = j)
+  })
+
+  incidence_episode_boot <- map_dfr(seq_along(sampled_clusters), function(j) {
+    episode_incidence_chapter %>%
+      filter(hhid == sampled_clusters[j]) %>%
+      mutate(bootstrap_cluster_id = j)
+  })
+
+  summarise_chapter_burden(
+    person_df = person_boot,
+    duration_episode_df = duration_episode_boot,
+    incidence_episode_df = incidence_episode_boot
+  ) %>%
+    mutate(bootstrap_iteration = i)
+}
+
+boot_estimates_chapter <- map_dfr(
+  seq_len(n_boot),
+  bootstrap_once_chapter
+)
+
+metric_vars <- c(
+  "total_not_at_risk_days",
+  "total_at_risk_days",
+  "total_closed_episode_days",
+  "total_prevalence_denominator_days",
+  "mean_duration_days",
+  "median_duration_days",
+  "incidence_per_1000_person_days",
+  "incidence_per_100_person_years",
+  "incidence_per_100_participants_28_days",
+  "person_time_prevalence_percent"
+)
+
+bootstrap_ci_chapter <- boot_estimates_chapter %>%
+  select(all_of(metric_vars)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "metric",
+    values_to = "boot_value"
+  ) %>%
+  group_by(metric) %>%
+  summarise(
+    ci_low = quantile(boot_value, 0.025, na.rm = TRUE),
+    ci_high = quantile(boot_value, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 13. Manuscript-ready table
+# ------------------------------------------------------------
+
+metric_labels <- tibble(
+  metric = c(
+    "total_not_at_risk_days",
+    "total_at_risk_days",
+    "total_closed_episode_days",
+    "total_prevalence_denominator_days",
+    "mean_duration_days",
+    "median_duration_days",
+    "incidence_per_1000_person_days",
+    "incidence_per_100_person_years",
+    "incidence_per_100_participants_28_days",
+    "person_time_prevalence_percent"
+  ),
+  Measure = c(
+    "Total non-at-risk episode time",
+    "Total time at risk",
+    "Total completed eNTS episode time",
+    "Total evaluable person-time for prevalence",
+    "Mean eNTS episode duration",
+    "Median eNTS episode duration",
+    "eNTS episode incidence",
+    "eNTS episode incidence",
+    "eNTS episode incidence",
+    "Person-time prevalence of eNTS episodes"
+  ),
+  Unit = c(
+    "person-days",
+    "person-days",
+    "episode-days",
+    "person-days",
+    "days",
+    "days",
+    "episodes per 1000 person-days at risk",
+    "episodes per 100 person-years at risk",
+    "episodes per 100 participants over 28 days at risk",
+    "%"
+  ),
+  digits = c(1, 1, 1, 1, 1, 1, 2, 1, 1, 2)
+)
+
+burden_table_metrics <- burden_estimates_chapter %>%
+  select(all_of(metric_vars)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "metric",
+    values_to = "estimate"
+  ) %>%
+  left_join(bootstrap_ci_chapter, by = "metric") %>%
+  left_join(metric_labels, by = "metric") %>%
+  mutate(
+    Estimate = case_when(
+      digits == 1 ~ format_est(estimate, 1),
+      digits == 2 ~ format_est(estimate, 2),
+      TRUE ~ format_est(estimate, 2)
+    ),
+    `95% CI` = case_when(
+      digits == 1 ~ paste0(format_est(ci_low, 1), "–", format_est(ci_high, 1)),
+      digits == 2 ~ paste0(format_est(ci_low, 2), "–", format_est(ci_high, 2)),
+      TRUE ~ paste0(format_est(ci_low, 2), "–", format_est(ci_high, 2))
+    ),
+    `Analysis denominator` = case_when(
+      metric %in% c("mean_duration_days", "median_duration_days") ~
+        paste0(
+          burden_estimates_chapter$n_duration_prevalence_episodes,
+          " completed episodes"
+        ),
+
+      metric %in% c(
+        "incidence_per_1000_person_days",
+        "incidence_per_100_person_years",
+        "incidence_per_100_participants_28_days"
+      ) ~
+        paste0(
+          burden_estimates_chapter$n_incidence_events,
+          " episodes / ",
+          format_est(burden_estimates_chapter$total_at_risk_days, 1),
+          " person-days at risk"
+        ),
+
+      metric == "person_time_prevalence_percent" ~
+        paste0(
+          format_est(burden_estimates_chapter$total_closed_episode_days, 1),
+          " completed episode-days / ",
+          format_est(burden_estimates_chapter$total_prevalence_denominator_days, 1),
+          " evaluable person-days"
+        ),
+
+      metric == "total_at_risk_days" ~
+        "Total follow-up minus all non-at-risk episode windows",
+
+      metric == "total_not_at_risk_days" ~
+        "Completed, left-censored, and right-censored episode windows",
+
+      metric == "total_closed_episode_days" ~
+        paste0(
+          burden_estimates_chapter$n_duration_prevalence_episodes,
+          " completed episodes"
+        ),
+
+      metric == "total_prevalence_denominator_days" ~
+        "At-risk time plus completed episode time",
+
+      TRUE ~ ""
+    )
+  ) %>%
+  select(
+    Measure,
+    Unit,
+    Estimate,
+    `95% CI`,
+    `Analysis denominator`
+  )
+
+burden_table_counts <- tibble(
+  Measure = c(
+    "Participants included",
+    "Households included",
+    "Total follow-up",
+    "Episode rows identified",
+    "Observed-onset episodes",
+    "Completed episodes with observed onset and offset",
+    "Right-censored observed-onset episodes",
+    "Left-censored/unbounded-onset episode rows",
+    "Participants with completed episodes",
+    "Incidence numerator setting"
+  ),
+  Unit = c(
+    "n", "n", "person-days", "episodes", "episodes", "episodes",
+    "episodes", "episodes", "n", ""
+  ),
+  Estimate = c(
+    burden_estimates_chapter$n_participants,
+    burden_estimates_chapter$n_households,
+    format_est(burden_estimates_chapter$total_followup_days, 1),
+    chapter_episode_audit$total_episode_rows,
+    chapter_episode_audit$observed_onset_episodes,
+    chapter_episode_audit$closed_onset_and_offset_episodes,
+    chapter_episode_audit$observed_onset_right_censored_episodes,
+    chapter_episode_audit$left_censored_or_unbounded_onset_rows,
+    burden_estimates_chapter$n_participants_with_duration_prevalence_episodes,
+    ifelse(
+      include_right_censored_in_incidence,
+      "Observed-onset episodes, including right-censored events",
+      "Completed episodes only; right-censored events excluded"
+    )
+  ),
+  `95% CI` = "",
+  `Analysis denominator` = ""
+)
+
+chapter_burden_table_full <- bind_rows(
+  burden_table_counts,
+  burden_table_metrics
+)
+
+cat("\n==============================\n")
+cat("MANUSCRIPT-READY BURDEN TABLE\n")
+cat("==============================\n")
+print(chapter_burden_table_full, width = Inf)
+
+# ------------------------------------------------------------
+# 14. Extra printed diagnostics
+# ------------------------------------------------------------
+
+cat("\n==============================\n")
+cat("EVENTS PER PARTICIPANT: COMPLETED EPISODES\n")
+cat("==============================\n")
+
+episode_duration_chapter %>%
+  count(pid, name = "n_completed_events") %>%
+  summarise(
+    n_participants_with_completed_events = n(),
+    min_events_per_person = min(n_completed_events),
+    max_events_per_person = max(n_completed_events),
+    median_events_per_person = median(n_completed_events),
+    mean_events_per_person = mean(n_completed_events)
+  ) %>%
+  print(width = Inf)
+
+episode_duration_chapter %>%
+  count(pid, name = "n_completed_events") %>%
+  count(n_completed_events, name = "n_participants") %>%
+  arrange(n_completed_events) %>%
+  print(width = Inf)
+
+cat("\n==============================\n")
+cat("DURATION DISTRIBUTION: COMPLETED EPISODES\n")
+cat("==============================\n")
+
+episode_duration_chapter %>%
+  summarise(
+    n_episodes = n(),
+    mean_duration = mean(duration_days, na.rm = TRUE),
+    median_duration = median(duration_days, na.rm = TRUE),
+    q1 = q_safe(duration_days, 0.25),
+    q3 = q_safe(duration_days, 0.75),
+    min = min(duration_days, na.rm = TRUE),
+    max = max(duration_days, na.rm = TRUE)
+  ) %>%
+  print(width = Inf)
+
+# ------------------------------------------------------------
+# 15. Save outputs
+# ------------------------------------------------------------
+
+dir.create(here::here("outputs", "tables"), recursive = TRUE, showWarnings = FALSE)
+
+write_csv(
+  chapter_burden_table_full,
+  here::here(
+    "outputs",
+    "tables",
+    "chapter5_ents_incidence_duration_prevalence_time_at_risk.csv"
+  )
+)
+
+write_csv(
+  chapter_episode_audit,
+  here::here(
+    "outputs",
+    "tables",
+    "chapter5_ents_episode_audit_counts.csv"
+  )
+)
+
+write_csv(
+  person_time_chapter,
+  here::here(
+    "outputs",
+    "tables",
+    "chapter5_ents_person_time_denominators.csv"
+  )
+)
+
+write_csv(
+  episode_duration_chapter,
+  here::here(
+    "outputs",
+    "tables",
+    "chapter5_ents_completed_episode_duration_data.csv"
+  )
+)
+
+write_csv(
+  boot_estimates_chapter,
+  here::here(
+    "outputs",
+    "tables",
+    "chapter5_ents_burden_bootstrap_estimates.csv"
+  )
+)
+```
+
+## Poisson recurrence sensitivity
+
+```{r}
+# ======================================================================
+# POISSON SENSITIVITY ANALYSIS OF RECURRENT eNTS EPISODES
+#
+# Sensitivity question:
+# Are repeat incident episodes more concentrated within individuals than
+# expected if distinct acquisitions occur as a Poisson process?
+#
+# IMPORTANT:
+# This uses EXACTLY the primary-analysis objects created above:
+#   - n_incidence_episodes = completed episodes used in incidence numerator
+#   - at_risk_days         = evaluable susceptible person-time
+#
+# It does NOT reconstruct episodes from PCR data.
+#
+# Interpretation:
+#   No excess of participants with >=2 episodes supports the interpretation
+#   that recurrent detections are compatible with distinct acquisitions.
+#
+#   Excess recurrence would be compatible with recrudescence/intermittent
+#   shedding, but would not prove it because heterogeneous exposure and
+#   household transmission can also produce clustering.
+# ======================================================================
+
+library(dplyr)
+library(tidyr)
+
+set.seed(20260826)
+B <- 20000L
+
+# ----------------------------------------------------------------------
+# 1. Use the exact participant-level numerator and denominator from the
+#    primary burden analysis
+# ----------------------------------------------------------------------
+
+poisson_df <- person_time_chapter %>%
+  transmute(
+    pid,
+    hhid,
+    at_risk_days = as.numeric(at_risk_days),
+    n_events = as.integer(n_incidence_episodes)
+  ) %>%
+  mutate(
+    n_events = replace_na(n_events, 0L)
+  )
+
+# A participant with no susceptible risk-time cannot contribute an incident
+# event. Stop if the frozen objects violate that logical requirement.
+bad_zero_risk <- poisson_df %>%
+  filter(at_risk_days <= 0, n_events > 0)
+
+if (nrow(bad_zero_risk) > 0) {
+  print(bad_zero_risk)
+  stop("At least one participant has an incident event but zero at-risk time.")
+}
+
+# Zero-risk participants with zero events contribute nothing to a Poisson
+# rate model with an offset, so exclude them from model fitting only.
+poisson_model_df <- poisson_df %>%
+  filter(
+    is.finite(at_risk_days),
+    at_risk_days > 0
+  )
+
+
+# ----------------------------------------------------------------------
+# 2. Intercept-only Poisson regression with susceptible person-time offset
+#
+# H0: incident episodes occur independently at a common rate per at-risk day.
+# ----------------------------------------------------------------------
+
+poisson_fit <- glm(
+  n_events ~ 1 + offset(log(at_risk_days)),
+  family = poisson(link = "log"),
+  data = poisson_model_df
+)
+
+poisson_model_df <- poisson_model_df %>%
+  mutate(
+    expected_events = fitted(poisson_fit)
+  )
+
+rate_per_day <- exp(coef(poisson_fit)[1])
+rate_per_1000_pd <- 1000 * rate_per_day
+
+rate_se <- sqrt(vcov(poisson_fit)[1, 1])
+
+rate_ci_per_1000_pd <- 1000 * exp(
+  coef(poisson_fit)[1] + c(-1, 1) * 1.96 * rate_se
+)
+
+
+# ----------------------------------------------------------------------
+# 3. CRITICAL AUDIT:
+#    This MUST reproduce the definitive incidence estimate above
+# ----------------------------------------------------------------------
+
+frozen_events <- nrow(episode_incidence_chapter)
+frozen_risk_days <- sum(person_time_chapter$at_risk_days, na.rm = TRUE)
+frozen_incidence <- frozen_events / frozen_risk_days * 1000
+
+stopifnot(
+  sum(poisson_model_df$n_events) == frozen_events,
+  isTRUE(all.equal(
+    sum(poisson_model_df$at_risk_days),
+    frozen_risk_days,
+    tolerance = 1e-10
+  )),
+  isTRUE(all.equal(
+    rate_per_1000_pd,
+    frozen_incidence,
+    tolerance = 1e-10
+  )),
+  isTRUE(all.equal(
+    frozen_incidence,
+    burden_estimates_chapter$incidence_per_1000_person_days,
+    tolerance = 1e-10
+  ))
+)
+
+cat("\n============================================================\n")
+cat("AUDIT: PRIMARY INCIDENCE REPRODUCED\n")
+cat("============================================================\n")
+cat("Events:                         ", frozen_events, "\n")
+cat("At-risk person-days:            ", round(frozen_risk_days, 2), "\n")
+cat("Incidence / 1000 person-days:   ", round(frozen_incidence, 4), "\n")
+
+
+# ----------------------------------------------------------------------
+# 4. Overall Poisson goodness-of-fit / dispersion
+#
+# Dispersion ~1: participant event counts approximately Poisson.
+# Dispersion >1: more heterogeneity/clustering than homogeneous Poisson.
+#
+# NOTE: this is a GLOBAL test and may reject because acquisition risk is
+# genuinely heterogeneous between people/households. It is therefore not
+# the most biologically specific test of recrudescence.
+# ----------------------------------------------------------------------
+
+pearson_chisq <- sum(
+  residuals(poisson_fit, type = "pearson")^2
+)
+
+pearson_df <- df.residual(poisson_fit)
+
+pearson_dispersion <- pearson_chisq / pearson_df
+
+pearson_gof_p <- pchisq(
+  pearson_chisq,
+  df = pearson_df,
+  lower.tail = FALSE
+)
+
+
+# ----------------------------------------------------------------------
+# 5. Observed versus Poisson-expected distribution of episode counts
+# ----------------------------------------------------------------------
+
+lambda <- poisson_model_df$expected_events
+
+event_distribution <- tibble(
+  episodes = c("0", "1", "2", "3+"),
+
+  observed = c(
+    sum(poisson_model_df$n_events == 0),
+    sum(poisson_model_df$n_events == 1),
+    sum(poisson_model_df$n_events == 2),
+    sum(poisson_model_df$n_events >= 3)
+  ),
+
+  poisson_expected = c(
+    sum(dpois(0, lambda)),
+    sum(dpois(1, lambda)),
+    sum(dpois(2, lambda)),
+    sum(ppois(2, lambda, lower.tail = FALSE))
+  )
+) %>%
+  mutate(
+    observed_minus_expected = observed - poisson_expected
+  )
+
+
+# ----------------------------------------------------------------------
+# 6. Targeted biological test 1:
+#    Are there MORE PEOPLE WITH >=2 distinct incident episodes than expected?
+# ----------------------------------------------------------------------
+
+observed_repeaters <- sum(poisson_model_df$n_events >= 2)
+
+expected_repeaters <- sum(
+  ppois(1, lambda, lower.tail = FALSE)
+)
+
+
+# ----------------------------------------------------------------------
+# 7. Targeted biological test 2:
+#    Are there MORE RECURRENT EVENTS (events after the first) than expected?
+# ----------------------------------------------------------------------
+
+observed_recurrent_events <- sum(
+  pmax(poisson_model_df$n_events - 1L, 0L)
+)
+
+# E[(N-1)+] for N ~ Poisson(lambda)
+expected_recurrent_events <- sum(
+  lambda - (1 - exp(-lambda))
+)
+
+
+# ----------------------------------------------------------------------
+# 8. Parametric simulation under the fitted Poisson acquisition process
+#
+# One-sided tests because the recrudescence hypothesis predicts EXCESS
+# within-person recurrence, not fewer repeat episodes.
+# ----------------------------------------------------------------------
+
+sim_stats <- replicate(
+  B,
+  {
+    y <- rpois(
+      n = length(lambda),
+      lambda = lambda
+    )
+
+    c(
+      repeaters = sum(y >= 2),
+      recurrent_events = sum(pmax(y - 1L, 0L))
+    )
+  }
+)
+
+p_excess_repeaters <- (
+  1 + sum(sim_stats["repeaters", ] >= observed_repeaters)
+) / (B + 1)
+
+p_excess_recurrent_events <- (
+  1 + sum(
+    sim_stats["recurrent_events", ] >= observed_recurrent_events
+  )
+) / (B + 1)
+
+
+# ----------------------------------------------------------------------
+# 9. Compact final output
+# ----------------------------------------------------------------------
+
+poisson_summary <- tibble(
+  participants_total = nrow(poisson_df),
+  participants_with_evaluable_risk_time = nrow(poisson_model_df),
+
+  total_incident_episodes = sum(poisson_model_df$n_events),
+  total_at_risk_person_days = sum(poisson_model_df$at_risk_days),
+
+  incidence_per_1000_person_days = rate_per_1000_pd,
+  incidence_95CI_low = rate_ci_per_1000_pd[1],
+  incidence_95CI_high = rate_ci_per_1000_pd[2],
+
+  pearson_dispersion = pearson_dispersion,
+  poisson_global_gof_p = pearson_gof_p,
+
+  observed_people_with_2plus_episodes = observed_repeaters,
+  poisson_expected_people_with_2plus_episodes = expected_repeaters,
+  p_excess_people_with_2plus_episodes = p_excess_repeaters,
+
+  observed_recurrent_events_after_first = observed_recurrent_events,
+  poisson_expected_recurrent_events_after_first = expected_recurrent_events,
+  p_excess_recurrent_events_after_first = p_excess_recurrent_events
+)
+
+cat("\n============================================================\n")
+cat("POISSON RECURRENT-EPISODE SENSITIVITY ANALYSIS\n")
+cat("============================================================\n\n")
+
+print(poisson_summary, width = Inf)
+
+cat("\nObserved versus Poisson-expected episode-count distribution:\n\n")
+print(event_distribution, n = Inf)
+
+cat("\nPoisson regression:\n\n")
+print(summary(poisson_fit))
+
+cat("\n============================================================\n")
+cat("INTERPRETATION\n")
+cat("============================================================\n")
+
+if (p_excess_repeaters >= 0.05 &&
+    p_excess_recurrent_events >= 0.05) {
+
+  cat(
+    "There is NO evidence of an excess of recurrent episodes within\n",
+    "participants relative to the fitted Poisson acquisition process.\n",
+    "This is compatible with recurrent detections representing distinct\n",
+    "acquisitions/reinfections rather than frequent recrudescence.\n",
+    sep = ""
+  )
+
+} else {
+
+  cat(
+    "Recurrent episodes are more concentrated within participants than\n",
+    "expected under the fitted Poisson acquisition process.\n",
+    "This is compatible with recrudescence/intermittent shedding, but is\n",
+    "not specific for it because heterogeneous exposure and household\n",
+    "transmission can also generate excess clustering.\n",
+    sep = ""
+  )
+}
+
+
+dir.create(here::here("outputs", "reproducibility"), recursive = TRUE, showWarnings = FALSE)
+readr::write_csv(
+  poisson_summary,
+  here::here("outputs", "reproducibility", "poisson_recurrence_summary.csv")
+)
+readr::write_csv(
+  event_distribution,
+  here::here("outputs", "reproducibility", "poisson_episode_count_distribution.csv")
+)
+
+```

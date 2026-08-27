@@ -1,0 +1,571 @@
+---
+title: "TiNTS epidemiological analysis: elastic-net variable selection"
+format: html
+execute:
+  echo: true
+  warning: true
+  message: true
+editor: source
+---
+
+This document reproduces the elastic-net variable-selection workflow used for the final Cox models, including household-grouped cross-validation and sensitivity across the prespecified alpha grid. Run `01_variable_preparation.qmd` first.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(forcats)
+library(glmnet)
+library(survival)
+library(readr)
+library(here)
+
+prepared <- readRDS(here::here("outputs", "reproducibility", "variable_selection_inputs.rds"))
+list2env(prepared, envir = .GlobalEnv)
+
+
+
+# --- Outcome (start–stop Cox) ---
+risk_intervals <- with(selection_df, Surv(tstart_num, tstop_num, event))
+
+# --- Mask adult/child-specific behaviours ---
+selection_df <- selection_df %>%
+  mutate(
+    smoke_adult_only          = if_else(is_adult == 1L, smoke_adult,          0L),
+    drink_alcohol_adult_only  = if_else(is_adult == 1L, drink_alcohol_adult,  0L),
+    attend_school_child_only  = if_else(is_child == 1L, attend_school_child,  0L)
+  )
+
+# --- Design matrix (no intercept), MAIN EFFECTS ONLY ---
+predictors_matrix <- model.matrix(
+  ~ water_piped_inside + water_piped_outside + water_borehole + water_unprotected +
+    utensil_piped_inside + utensil_piped_outside + utensil_river + utensil_borehole + utensil_unprotected +
+    bathe_bottled + bathe_piped_inside + bathe_piped_outside + bathe_borehole + bathe_unprotected +
+    food_container + food_refrigerator + food_cupboard + food_surfaces +
+    tpt_year + tpt_month + tpt_week + tpt_daily +
+    ndir_year + ndir_month + ndir_week + ndir_daily +
+    meat_month + meat_year + meat_daily + meat_never +
+    fish_month + fish_daily + fish_never +
+    is_adult + days_out_day_z + days_out_eve_z + cls_contactnum_z + sleep_next_z +
+    goto_market + eat_atcafe + attend_bar + attend_worship +
+    hiv_reactive + hiv_unknown + toilet_type_binary + water_treated +
+    hand_index_z + veg_handling_index_z + standing_rainwater + flood_last_year +
+    shared_plates + river_water_contact + hard_floor + keep_animals + hh_visitors +
+    river_distance_z + hours_in_house_z +
+    smoke_adult_only + drink_alcohol_adult_only + attend_school_child_only +
+    age_yr_z + sex + wealth_index_z - 1,
+  data = selection_df
+)
+
+# --- Ensure a complete group ID mapping for all columns ---
+# col_group_id is a named integer vector linking design-matrix columns to selection groups.
+# For any columns missing a group ID, assign unique new group IDs so nothing gets dropped silently.
+grp_map <- col_group_id
+missing <- setdiff(colnames(predictors_matrix), names(grp_map))
+if (length(missing)) {
+  grp_map <- c(grp_map, setNames(seq.int(max(grp_map, na.rm = TRUE) + 1L,
+                                         max(grp_map, na.rm = TRUE) + length(missing)),
+                                 missing))
+}
+grp_map <- grp_map[colnames(predictors_matrix)]  # align order
+
+# --- Household-grouped CV folds (avoid leakage) ---
+set.seed(1)
+k_folds <- min(10L, length(unique(selection_df$hhid)))
+households <- unique(selection_df$hhid)
+household_to_fold <- setNames(sample(rep(seq_len(k_folds), length.out = length(households))), households)
+fold_by_household <- as.integer(household_to_fold[as.character(selection_df$hhid)])
+
+# --- Elastic Net CV with relaxed path (so we can reach ≥ 12 groups) ---
+set.seed(1)
+elastic_cv <- cv.glmnet(
+  x = predictors_matrix,
+  y = risk_intervals,
+  family = "cox",
+  alpha = 0.15,
+  type.measure = "C",
+  standardize = TRUE,
+  foldid = fold_by_household,
+  nlambda = 500,
+  lambda.min.ratio = 1e-5,
+  pmax = ncol(predictors_matrix),
+  relax = TRUE
+)
+
+# --- Count groups active at each lambda; pick first λ with ≥ 12 groups ---
+glmnet_fit <- elastic_cv$glmnet.fit
+beta_mat   <- as.matrix(coef(glmnet_fit))                 # rows = vars, cols = lambdas
+nz_mask    <- beta_mat != 0
+# Simpler: for each lambda, compute # of unique groups among nonzero vars
+nnz_groups <- integer(ncol(beta_mat))
+for (j in seq_len(ncol(beta_mat))) {
+  nz_vars <- rownames(beta_mat)[nz_mask[, j]]
+  nnz_groups[j] <- length(unique(grp_map[nz_vars]))
+}
+
+target_groups <- 12L
+idx_ge <- which(nnz_groups >= target_groups)
+
+lambda_star <- if (length(idx_ge)) glmnet_fit$lambda[min(idx_ge)] else min(glmnet_fit$lambda)
+
+# --- At lambda_star, identify selected groups and trim to exactly 12 if needed ---
+coef_star <- as.numeric(beta_mat[, which(glmnet_fit$lambda == lambda_star)])
+names(coef_star) <- rownames(beta_mat)
+
+active_vars   <- names(coef_star)[coef_star != 0]
+active_groups <- unique(grp_map[active_vars])
+
+if (length(active_groups) > target_groups) {
+  # Rank groups by the largest absolute coefficient within the group at lambda_star
+  grp_strength <- tapply(abs(coef_star[names(grp_map)]), grp_map, max, na.rm = TRUE)
+  keep_groups  <- names(sort(grp_strength[as.character(active_groups)], decreasing = TRUE))[seq_len(target_groups)]
+  active_groups <- as.integer(keep_groups)
+}
+
+# --- Expand to ALL variables in the selected groups (group-keeping rule) ---
+selected_terms <- names(grp_map)[grp_map %in% active_groups]
+
+# --- Always force adjusters (and avoid duplicates) ---
+forced_adjusters <- c("age_yr_z","sex","wealth_index_z")
+selected_terms <- unique(c(selected_terms, forced_adjusters))
+
+# Save the primary selected terms and group identifiers.
+dir.create(here::here("outputs", "reproducibility"), recursive = TRUE, showWarnings = FALSE)
+primary_selection <- tibble(
+  term = selected_terms,
+  group_id = unname(grp_map[selected_terms]),
+  forced_adjuster = selected_terms %in% forced_adjusters
+)
+write_csv(
+  primary_selection,
+  here::here("outputs", "reproducibility", "elastic_net_primary_selected_terms.csv")
+)
+
+# ============================================================
+# 14e. Elastic net alpha/lambda sensitivity analysis
+# ============================================================
+# Purpose:
+#   Sensitivity analysis for the data-driven variable selection step.
+#
+#   We vary the elastic net mixing parameter (alpha) and inspect the
+#   lambda path for each alpha. For each alpha, we identify the sparsest
+#   lambda solution that reaches approximately the prespecified target of
+#   12 candidate selection units.
+#
+#   IMPORTANT:
+#   - Forced adjusters (age, sex, wealth) are included in the penalised Cox
+#     design matrix but are given penalty.factor = 0 and are NOT counted
+#     toward the 12 candidate predictors.
+#   - Grouped categorical predictors count as one candidate selection unit.
+#     For example, all water-source dummies count as the parent group
+#     "water_source".
+#   - If a lambda step jumps from <12 to >12 groups, groups are trimmed back
+#     to 12 using the largest absolute coefficient within each group. This
+#     mirrors the main analytic logic while making the tuning sensitivity
+#     explicit and auditable.
+#
+# Outputs are written to outputs/reproducibility/.
+
+
+# ----------------------------
+# 0) User-controlled settings
+# ----------------------------
+
+alpha_grid <- c(0.05, 0.10, 0.15, 0.25, 0.50, 0.75, 1.00)
+
+target_candidate_units <- 12L
+
+# For the "near-target" stability analysis:
+# e.g. target +/- 2 means models with 10-14 active candidate units
+target_neighbourhood <- 2L
+
+n_lambda_sensitivity <- 500L
+lambda_min_ratio_sensitivity <- 1e-5
+set.seed(1)
+
+# ----------------------------
+# 1) Safety checks
+# ----------------------------
+
+stopifnot(exists("selection_df"))
+stopifnot(exists("predictors_matrix"))
+stopifnot(exists("col_group_id"))
+stopifnot(exists("group_map"))
+
+stopifnot(all(c("tstart_num", "tstop_num", "event", "hhid") %in% names(selection_df)))
+
+if (nrow(predictors_matrix) != nrow(selection_df)) {
+  stop(
+    "predictors_matrix and selection_df have different row numbers. ",
+    "Recreate predictors_matrix using the same rows as selection_df before running this sensitivity chunk."
+  )
+}
+
+# Outcome
+risk_intervals_sens <- with(selection_df, Surv(tstart_num, tstop_num, event))
+
+# Complete-case rows for glmnet
+complete_rows <- complete.cases(predictors_matrix) &
+  is.finite(selection_df$tstart_num) &
+  is.finite(selection_df$tstop_num) &
+  !is.na(selection_df$event)
+
+if (sum(!complete_rows) > 0) {
+  message("Dropping ", sum(!complete_rows), " rows with incomplete outcome or predictor data for sensitivity analysis.")
+}
+
+x_sens <- predictors_matrix[complete_rows, , drop = FALSE]
+y_sens <- risk_intervals_sens[complete_rows]
+dat_sens <- selection_df[complete_rows, , drop = FALSE]
+
+# ----------------------------
+# 2) Household-grouped folds
+# ----------------------------
+# Use existing fold_by_household if available and correctly sized;
+# otherwise recreate fixed household-level folds.
+
+if (exists("fold_by_household") && length(fold_by_household) == nrow(selection_df)) {
+  foldid_sens <- fold_by_household[complete_rows]
+} else {
+  set.seed(1)
+  k_folds <- min(10L, length(unique(dat_sens$hhid)))
+  households <- unique(dat_sens$hhid)
+
+  household_to_fold <- setNames(
+    sample(rep(seq_len(k_folds), length.out = length(households))),
+    households
+  )
+
+  foldid_sens <- as.integer(household_to_fold[as.character(dat_sens$hhid)])
+}
+
+# ----------------------------
+# 3) Align group map to design matrix columns
+# ----------------------------
+
+grp_map_sens <- col_group_id
+
+missing_from_group_map <- setdiff(colnames(x_sens), names(grp_map_sens))
+
+if (length(missing_from_group_map) > 0) {
+  grp_map_sens <- c(
+    grp_map_sens,
+    setNames(
+      seq.int(
+        max(grp_map_sens, na.rm = TRUE) + 1L,
+        max(grp_map_sens, na.rm = TRUE) + length(missing_from_group_map)
+      ),
+      missing_from_group_map
+    )
+  )
+}
+
+grp_map_sens <- grp_map_sens[colnames(x_sens)]
+
+if (any(is.na(grp_map_sens))) {
+  stop("Some columns in x_sens still do not have a group ID.")
+}
+
+# ----------------------------
+# 4) Forced adjusters
+# ----------------------------
+# These are included but not penalised and not counted toward the 12.
+# This handles both numeric columns and possible model.matrix expansion of sex.
+
+forced_cols <- grep(
+  pattern = "^(age_yr_z|wealth_index_z)$|^sex",
+  x = colnames(x_sens),
+  value = TRUE
+)
+
+if (length(forced_cols) == 0) {
+  warning("No forced adjuster columns identified in predictors_matrix. Check age/sex/wealth names.")
+}
+
+penalty_factor <- ifelse(colnames(x_sens) %in% forced_cols, 0, 1)
+
+candidate_cols <- setdiff(colnames(x_sens), forced_cols)
+
+# ----------------------------
+# 5) Human-readable selection-unit labels
+# ----------------------------
+
+group_id_to_label <- tibble(
+  term = names(grp_map_sens),
+  group_id = as.integer(grp_map_sens)
+) %>%
+  mutate(
+    selection_unit = case_when(
+      group_id %in% seq_along(group_map) ~ names(group_map)[group_id],
+      TRUE ~ term
+    )
+  ) %>%
+  distinct(group_id, selection_unit)
+
+lookup_unit <- function(group_ids) {
+  group_id_to_label$selection_unit[
+    match(as.integer(group_ids), group_id_to_label$group_id)
+  ]
+}
+
+# ----------------------------
+# 6) Helper functions
+# ----------------------------
+
+count_candidate_units_at_lambda <- function(beta_j, grp_map, candidate_cols) {
+  active_terms <- names(beta_j)[beta_j != 0]
+  active_candidate_terms <- intersect(active_terms, candidate_cols)
+
+  tibble(
+    n_candidate_terms = length(active_candidate_terms),
+    n_candidate_units = length(unique(grp_map[active_candidate_terms]))
+  )
+}
+
+extract_target_solution <- function(cv_fit, alpha_value, target_units) {
+
+  glmnet_fit <- cv_fit$glmnet.fit
+  beta_mat <- as.matrix(coef(glmnet_fit))
+  lambda_vec <- glmnet_fit$lambda
+
+  # Count active candidate terms and candidate selection units at each lambda
+  path_counts <- map_dfr(seq_along(lambda_vec), function(j) {
+    beta_j <- beta_mat[, j]
+    names(beta_j) <- rownames(beta_mat)
+
+    out <- count_candidate_units_at_lambda(
+      beta_j = beta_j,
+      grp_map = grp_map_sens,
+      candidate_cols = candidate_cols
+    )
+
+    tibble(
+      alpha = alpha_value,
+      lambda_index = j,
+      lambda = lambda_vec[j],
+      log_lambda = log(lambda_vec[j]),
+      cvm = cv_fit$cvm[match(lambda_vec[j], cv_fit$lambda)],
+      cvsd = cv_fit$cvsd[match(lambda_vec[j], cv_fit$lambda)],
+      n_candidate_terms = out$n_candidate_terms,
+      n_candidate_units = out$n_candidate_units
+    )
+  })
+
+  # Identify the sparsest lambda that reaches >= target units
+  idx_ge_target <- which(path_counts$n_candidate_units >= target_units)
+
+  if (length(idx_ge_target) > 0) {
+    chosen_index <- min(idx_ge_target)
+    target_reached <- TRUE
+  } else {
+    chosen_index <- which.min(abs(path_counts$n_candidate_units - target_units))
+    target_reached <- FALSE
+  }
+
+  lambda_target <- path_counts$lambda[chosen_index]
+
+  beta_target <- beta_mat[, chosen_index]
+  names(beta_target) <- rownames(beta_mat)
+
+  active_terms <- names(beta_target)[beta_target != 0]
+  active_candidate_terms <- intersect(active_terms, candidate_cols)
+
+  active_candidate_groups <- unique(grp_map_sens[active_candidate_terms])
+
+  # Rank active groups by the largest absolute coefficient in the group
+  group_strength <- tibble(
+    term = active_candidate_terms,
+    group_id = as.integer(grp_map_sens[active_candidate_terms]),
+    abs_beta = abs(beta_target[active_candidate_terms])
+  ) %>%
+    group_by(group_id) %>%
+    summarise(
+      max_abs_beta = max(abs_beta, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(max_abs_beta))
+
+  # If lambda jump gives more than 12, trim to the strongest 12 groups
+  selected_group_ids <- group_strength$group_id
+
+  trimmed_to_target <- FALSE
+
+  if (length(selected_group_ids) > target_units) {
+    selected_group_ids <- selected_group_ids[seq_len(target_units)]
+    trimmed_to_target <- TRUE
+  }
+
+  selected_units <- lookup_unit(selected_group_ids)
+
+  # Expand selected groups back to all corresponding design-matrix columns
+  selected_terms_expanded <- names(grp_map_sens)[grp_map_sens %in% selected_group_ids]
+  selected_terms_expanded <- intersect(selected_terms_expanded, colnames(x_sens))
+  selected_terms_expanded <- setdiff(selected_terms_expanded, forced_cols)
+
+  # Also save active terms before group expansion
+  active_units_untrimmed <- lookup_unit(active_candidate_groups)
+
+  summary_row <- tibble(
+    alpha = alpha_value,
+    chosen_lambda = lambda_target,
+    chosen_log_lambda = log(lambda_target),
+    target_reached = target_reached,
+    trimmed_to_target = trimmed_to_target,
+    n_candidate_units_before_trimming = length(active_candidate_groups),
+    n_candidate_units_after_trimming = length(selected_group_ids),
+    n_candidate_terms_active = length(active_candidate_terms),
+    n_candidate_terms_after_group_expansion = length(selected_terms_expanded),
+    cvm_at_chosen_lambda = path_counts$cvm[chosen_index],
+    best_cvm_for_alpha = max(path_counts$cvm, na.rm = TRUE),
+    delta_cvm_from_best = max(path_counts$cvm, na.rm = TRUE) - path_counts$cvm[chosen_index],
+    selected_units = paste(selected_units, collapse = "; "),
+    selected_terms_expanded = paste(selected_terms_expanded, collapse = "; "),
+    active_units_before_trimming = paste(active_units_untrimmed, collapse = "; ")
+  )
+
+  selected_units_long <- tibble(
+    alpha = alpha_value,
+    chosen_lambda = lambda_target,
+    group_id = selected_group_ids,
+    selection_unit = selected_units
+  )
+
+  active_near_target_long <- path_counts %>%
+    filter(
+      n_candidate_units >= target_units - target_neighbourhood,
+      n_candidate_units <= target_units + target_neighbourhood
+    ) %>%
+    select(alpha, lambda_index, lambda, log_lambda, cvm, n_candidate_units) %>%
+    mutate(
+      active_units = map(lambda_index, function(j) {
+        beta_j <- beta_mat[, j]
+        names(beta_j) <- rownames(beta_mat)
+
+        active_terms_j <- names(beta_j)[beta_j != 0]
+        active_candidate_terms_j <- intersect(active_terms_j, candidate_cols)
+        active_groups_j <- unique(grp_map_sens[active_candidate_terms_j])
+
+        lookup_unit(active_groups_j)
+      })
+    ) %>%
+    unnest(active_units, names_repair = "minimal") %>%
+    rename(selection_unit = active_units)
+
+  list(
+    path_counts = path_counts,
+    summary_row = summary_row,
+    selected_units_long = selected_units_long,
+    active_near_target_long = active_near_target_long,
+    cv_fit = cv_fit
+  )
+}
+
+# ----------------------------
+# 7) Fit cv.glmnet across alpha values
+# ----------------------------
+
+fit_one_alpha <- function(alpha_value) {
+
+  message("Fitting elastic net sensitivity model for alpha = ", alpha_value)
+
+  cv_fit <- cv.glmnet(
+    x = x_sens,
+    y = y_sens,
+    family = "cox",
+    alpha = alpha_value,
+    type.measure = "C",
+    standardize = TRUE,
+    foldid = foldid_sens,
+    nlambda = n_lambda_sensitivity,
+    lambda.min.ratio = lambda_min_ratio_sensitivity,
+    penalty.factor = penalty_factor,
+    pmax = ncol(x_sens),
+    maxit = 100000
+  )
+
+  extract_target_solution(
+    cv_fit = cv_fit,
+    alpha_value = alpha_value,
+    target_units = target_candidate_units
+  )
+}
+
+sensitivity_fits <- map(alpha_grid, fit_one_alpha)
+
+# ----------------------------
+# 8) Bind outputs
+# ----------------------------
+
+sens_path_df <- map_dfr(sensitivity_fits, "path_counts")
+
+target12_summary <- map_dfr(sensitivity_fits, "summary_row")
+
+target12_selected_units <- map_dfr(sensitivity_fits, "selected_units_long")
+
+near_target_selected_units <- map_dfr(sensitivity_fits, "active_near_target_long")
+
+target12_selection_frequency <- target12_selected_units %>%
+  count(selection_unit, name = "n_alpha_selected") %>%
+  mutate(
+    n_alpha_tested = length(alpha_grid),
+    proportion_alpha_selected = n_alpha_selected / n_alpha_tested
+  ) %>%
+  arrange(desc(proportion_alpha_selected), selection_unit)
+
+near_target_selection_frequency <- near_target_selected_units %>%
+  distinct(alpha, lambda_index, selection_unit) %>%
+  count(selection_unit, name = "n_near_target_models_selected") %>%
+  mutate(
+    n_near_target_models = near_target_selected_units %>%
+      distinct(alpha, lambda_index) %>%
+      nrow(),
+    proportion_near_target_models_selected =
+      n_near_target_models_selected / n_near_target_models
+  ) %>%
+  arrange(desc(proportion_near_target_models_selected), selection_unit)
+
+# ----------------------------
+# 9) Save tables
+# ----------------------------
+
+dir.create(here::here("outputs", "reproducibility"), recursive = TRUE, showWarnings = FALSE)
+
+write_csv(
+  sens_path_df,
+  here::here("outputs", "reproducibility", "elasticnet_alpha_lambda_path_summary.csv")
+)
+
+write_csv(
+  target12_summary,
+  here::here("outputs", "reproducibility", "elasticnet_alpha_target12_summary.csv")
+)
+
+write_csv(
+  target12_selected_units,
+  here::here("outputs", "reproducibility", "elasticnet_alpha_target12_selected_units.csv")
+)
+
+write_csv(
+  target12_selection_frequency,
+  here::here("outputs", "reproducibility", "elasticnet_alpha_target12_selection_frequency.csv")
+)
+
+write_csv(
+  near_target_selection_frequency,
+  here::here("outputs", "reproducibility", "elasticnet_near_target_selection_frequency.csv")
+)
+
+saveRDS(
+  list(
+    elastic_cv = elastic_cv,
+    lambda_star = lambda_star,
+    selected_terms = selected_terms,
+    forced_adjusters = forced_adjusters,
+    target12_summary = target12_summary,
+    target12_selected_units = target12_selected_units,
+    target12_selection_frequency = target12_selection_frequency
+  ),
+  here::here("outputs", "reproducibility", "elastic_net_results.rds")
+)
+```
