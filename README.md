@@ -1,10 +1,14 @@
 # TiNTS study analysis
 
-This repository contains the R/Quarto workflows used for the epidemiological analyses supporting the TiNTS manuscript.
+This repository contains the analysis code supporting the TiNTS manuscript:
 
-## R analysis workflow
+**Frequent asymptomatic carriage and household transmission of non-typhoidal Salmonella in urban Malawi: a prospective longitudinal cohort and modelling study**
 
-Run the documents in order:
+The repository contains three main components.
+
+## 1. Epidemiological analyses
+
+The top-level Quarto documents reproduce the principal R-based epidemiological analyses:
 
 1. `01_variable_preparation.qmd`
 2. `02_elastic_net_selection.qmd`
@@ -12,7 +16,9 @@ Run the documents in order:
 4. `04_episode_burden_and_poisson.qmd`
 5. `05_ct_threshold_sensitivity.qmd`
 
-The scripts expect the corresponding analysis inputs under:
+These cover preparation of the epidemiological analysis dataset, elastic-net variable selection, first-event and recurrent-event Cox models, episode burden and recurrence analyses, and Ct-threshold sensitivity analyses.
+
+The workflows expect the corresponding analytic inputs under:
 
 - `data_raw/`
 - `data_clean/`
@@ -20,24 +26,55 @@ The scripts expect the corresponding analysis inputs under:
 
 Generated outputs are written beneath `outputs/`.
 
-The public workflows are streamlined from the development analysis notebooks. Exploratory code, superseded analyses, and manuscript-layout code have been omitted, while the analysis steps required to fit the reported models and generate the principal numerical outputs are retained.
+The public workflows are streamlined from the development analysis notebooks. Exploratory code, superseded analyses, and manuscript-layout code have been omitted while retaining the analysis steps required to fit the reported models and generate the principal numerical outputs.
 
-## Bayesian models
+## 2. Bayesian transmission models
 
-The hidden Markov models are supplied separately with their Stan code and R/Quarto calling workflows.
+The `bayesian_models/` directory contains the hidden Markov models used to estimate latent acquisition, clearance, and household dependence.
 
-The full Bayesian fits are computationally intensive, particularly Model B, and may require multi-day runtime. The repository therefore documents the model specification, data-preparation workflow, priors, and sampler settings, together with the fitted posterior summaries used for the manuscript where appropriate.
+It includes:
+
+- **Model A:** individual susceptible–infected hidden Markov model;
+- **Model B:** household-coupled hidden Markov model;
+- the corresponding Stan model files;
+- R/Quarto workflows documenting data preparation, priors, sampler settings, model fitting, and posterior summaries.
+
+Model B is computationally intensive because household latent states are modelled jointly and may require multi-day runtime depending on hardware.
+
+See `bayesian_models/README.md` for details.
+
+## 3. Genomics pipeline
+
+The `genomics_pipeline/` directory contains the bacterial genomics workflow used for the TiNTS sequencing analyses.
+
+It includes:
+
+- the primary production Bash pipeline;
+- the mixed-library *Salmonella* rescue workflow;
+- helper code and frozen analysis configuration;
+- Conda environment specifications;
+- software and database provenance;
+- an example library manifest;
+- SHA256 checksums.
+
+The workflow includes read QC, human-read depletion, taxonomic classification, assembly, genome QC, *Salmonella* typing, AMR characterisation, annotation, core-genome analysis, and phylogenetic inference.
+
+See `genomics_pipeline/README.md` for details.
 
 ## Data availability
 
 Participant-level analytic data are not included in this public repository.
 
-A pseudonymised analytic dataset sufficient to run the R workflows can be made available for confidential peer review and, subject to the study's ethical approvals and data-sharing arrangements, through controlled access for research use.
+A pseudonymised analytic dataset sufficient to run the R workflows can be made available for confidential peer review and, subject to the study's ethical approvals and data-sharing agreements, through controlled access for research use.
 
-The public repository does not contain the participant, household, or sample-level analytic datasets.
+Raw sequencing reads and assembled genomes are deposited separately in the European Nucleotide Archive as described in the manuscript.
+
+Study standard operating procedures, case record forms, participant information documents, and consent and assent materials are deposited separately on Zenodo.
 
 ## Reproducibility
 
-The R workflows are designed to be run from the repository root with the corresponding analytic inputs placed in `data_raw/`, `data_clean/`, and `rds/`.
+Package requirements and analysis settings are documented within the individual workflows.
 
-Package requirements are specified within the individual Quarto documents. Analysis outputs are written to the `outputs/` directory.
+The Bayesian and genomics directories contain additional model, software, database, and configuration information required to reproduce those components of the study.
+
+This repository represents the analysis-code version corresponding to the submitted manuscript.
