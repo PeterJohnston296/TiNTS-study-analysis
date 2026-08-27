@@ -1,0 +1,12 @@
+# Participant-level analytic data are not committed to GitHub
+data_raw/
+data_clean/
+rds/
+
+# Generated outputs
+outputs/
+*_files/
+.html
+.Rhistory
+.RData
+.DS_Store
